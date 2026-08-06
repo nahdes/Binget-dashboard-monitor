@@ -613,8 +613,8 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 // ────────────────────────────────────────────────
 // Start
 // ────────────────────────────────────────────────
-server.listen(cfg.port, '127.0.0.1', () => {
-  log(`Dashboard listening on http://127.0.0.1:${cfg.port}${cfg.accessToken ? ' (token required)' : ''}`);
+server.listen(cfg.port, '0.0.0.0', () => {
+  log(`Dashboard listening on http://0.0.0.0:${cfg.port}${cfg.accessToken ? ' (token required)' : ''}`);
 });
 
 if (cfg.services.length) {
