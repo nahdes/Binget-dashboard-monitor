@@ -3,9 +3,9 @@
 
 try { require('dotenv').config(); } catch (_) { /* dotenv optional */ }
 
-const pm2 = require('pm2');
 const http = require('http');
 const https = require('https');
+const net = require('net');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -15,46 +15,67 @@ let nodemailer = null;
 try { nodemailer = require('nodemailer'); } catch (_) { /* email optional */ }
 
 // ────────────────────────────────────────────────
-// Config (from .env or defaults)
+// Config (from .env or defaults) — no PM2 anywhere in this file.
 // ────────────────────────────────────────────────
 const cfg = {
   port: parseInt(process.env.PORT || '3099', 10),
-  checkInterval: parseInt(process.env.CHECK_INTERVAL_MS || '10000', 10),
+  checkIntervalMs: parseInt(process.env.CHECK_INTERVAL_MS || '10000', 10),
+  checkTimeoutMs: parseInt(process.env.CHECK_TIMEOUT_MS || '3000', 10),
   historyMax: parseInt(process.env.HISTORY_MAX || '300', 10),
-  metricsBuffer: parseInt(process.env.METRICS_BUFFER || '60', 10),
-  memoryAlertMb: parseInt(process.env.MEMORY_ALERT_MB || '5500', 10),
-  cpuSustainedPct: parseInt(process.env.CPU_SUSTAINED_PCT || '85', 10),
-  cpuSustainedPolls: parseInt(process.env.CPU_SUSTAINED_POLLS || '4', 10),
   webhookUrl: process.env.ALERT_WEBHOOK_URL || '',
   throttleMs: parseInt(process.env.ALERT_THROTTLE_MS || '300000', 10),
   escalationMin: parseInt(process.env.ESCALATION_MINUTES || '10', 10),
   accessToken: process.env.ACCESS_TOKEN || '',
-  ignore: new Set((process.env.IGNORE_PROCESSES || 'pm2-dashboard').split(',').map(s => s.trim()).filter(Boolean)),
+  ignore: new Set((process.env.IGNORE_SERVICES || '').split(',').map(s => s.trim()).filter(Boolean)),
   smtp: {
     host: process.env.SMTP_HOST || '',
     port: parseInt(process.env.SMTP_PORT || '587', 10),
     user: process.env.SMTP_USER || '',
     pass: process.env.SMTP_PASS || '',
     to: process.env.ALERT_EMAIL_TO || ''
-  }
+  },
+  // SERVICES format: name:host:port[:httpPath], comma-separated.
+  // No httpPath -> plain TCP connect check. With httpPath -> HTTP GET, expects 2xx/3xx.
+  services: (process.env.SERVICES || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+    .map(entry => {
+      const parts = entry.split(':');
+      const [name, host, portStr, ...pathParts] = parts;
+      return {
+        name,
+        host: host || '127.0.0.1',
+        port: parseInt(portStr, 10),
+        path: pathParts.length ? pathParts.join(':') : null
+      };
+    })
+    .filter(s => s.name && s.port),
+  // SERVICE_LOGS format: name:/absolute/path/to.log, comma-separated. Optional, powers /logs/:name.
+  serviceLogs: (process.env.SERVICE_LOGS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+    .reduce((map, entry) => {
+      const idx = entry.indexOf(':');
+      if (idx > 0) map[entry.slice(0, idx)] = entry.slice(idx + 1);
+      return map;
+    }, {})
 };
 
-const HISTORY_FILE = path.join(__dirname, 'pm2-downtime-history.json');
-const LOG_FILE = path.join(__dirname, 'pm2-monitor.log');
+const HISTORY_FILE = path.join(__dirname, 'monitor-downtime-history.json');
+const LOG_FILE = path.join(__dirname, 'monitor.log');
 const MAX_LOG_BYTES = 5 * 1024 * 1024;
 const MONITOR_STARTED_AT = Date.now();
 
 // ────────────────────────────────────────────────
 // State
 // ────────────────────────────────────────────────
-let processes = [];
-let history = [];
-let metrics = {};               // name -> [{ts, cpu, mem}]
+let history = [];               // { name, downAt, upAt, durationMs, reason }
+let services = [];              // [{ name, host, port, path, status, latencyMs, statusCode, lastCheckedAt }]
 let lastAlert = {};
 let lastPollAt = null;
 let historyDirty = false;
-let busConnected = false;
-let pm2ConnectionReady = false;
 
 try {
   if (fs.existsSync(HISTORY_FILE)) {
@@ -169,9 +190,9 @@ function sendAlert(text, name = '', kind = 'generic') {
         auth: cfg.smtp.user ? { user: cfg.smtp.user, pass: cfg.smtp.pass } : undefined
       });
       transporter.sendMail({
-        from: cfg.smtp.user || 'pm2-monitor@localhost',
+        from: cfg.smtp.user || 'monitor@localhost',
         to: cfg.smtp.to,
-        subject: `[PM2] ${text.slice(0, 80)}`,
+        subject: `[Monitor] ${text.slice(0, 80)}`,
         text
       }).catch(e => log('Email error: ' + e.message));
     } catch (e) {
@@ -183,7 +204,7 @@ function sendAlert(text, name = '', kind = 'generic') {
 // ────────────────────────────────────────────────
 // Event recording
 // ────────────────────────────────────────────────
-function recordDown(name, reason = 'status') {
+function recordDown(name, reason = 'unreachable') {
   if (cfg.ignore.has(name)) return;
   const open = history.find(h => h.name === name && !h.upAt);
   if (open) return;
@@ -203,134 +224,74 @@ function recordUp(name) {
   sendAlert(`\u{1F7E2} ${name} is back UP (was down ${formatDuration(open.durationMs)})`, name, 'up');
 }
 
-// Intentional removal (pm2 delete): close any open outage silently, no alert.
-function recordDeleted(name) {
-  const open = history.find(h => h.name === name && !h.upAt);
-  if (open) {
-    open.upAt = new Date().toISOString();
-    open.durationMs = 0;
-    open.reason = (open.reason || 'status') + ' (process deleted)';
-    historyDirty = true;
-    log(`INFO -> ${name} removed from PM2, closing open outage record without alert`);
-  }
-}
-
-// ────────────────────────────────────────────────
-// PM2 Event Bus (real-time) — reuses the single persistent connection
-// ────────────────────────────────────────────────
-function startBus() {
-  pm2.launchBus((err, bus) => {
-    if (err) {
-      log('Bus error: ' + err.message);
-      setTimeout(startBus, 5000);
-      return;
+function checkEscalations() {
+  const now = Date.now();
+  history.forEach(h => {
+    if (h.upAt) return;
+    const downMin = (now - new Date(h.downAt).getTime()) / 60000;
+    if (downMin >= cfg.escalationMin) {
+      sendAlert(`\u{1F6A8} ESCALATION: ${h.name} still DOWN for ${Math.round(downMin)} min`, h.name, 'escalation');
     }
-    busConnected = true;
-    log('PM2 event bus connected');
-
-    bus.on('process:event', (packet) => {
-      const name = packet.process && packet.process.name;
-      if (!name || cfg.ignore.has(name)) return;
-      const event = packet.event;
-
-      if (event === 'exit' || event === 'stop') {
-        recordDown(name, event);
-      } else if (event === 'delete') {
-        recordDeleted(name);
-      } else if (event === 'online' || event === 'start') {
-        recordUp(name);
-      } else if (event === 'restart') {
-        recordUp(name); // close any window that was open
-        history.unshift({
-          name,
-          downAt: new Date().toISOString(),
-          upAt: new Date().toISOString(),
-          durationMs: 0,
-          reason: 'restart event'
-        });
-        historyDirty = true;
-        sendAlert(`\u26A0\uFE0F ${name} restarted (crash-loop or manual restart)`, name, 'restart');
-      }
-    });
-
-    bus.on('error', () => {
-      busConnected = false;
-      log('Bus disconnected - retrying...');
-      setTimeout(startBus, 5000);
-    });
   });
 }
 
 // ────────────────────────────────────────────────
-// Metrics polling — uses the already-open pm2 connection, never disconnects mid-run
+// Watchdog — TCP / HTTP reachability checks
 // ────────────────────────────────────────────────
-function pollMetrics() {
-  if (!pm2ConnectionReady) return;
-
-  pm2.list((err, list) => {
-    if (err) {
-      log('PM2 list error: ' + err.message);
-      return;
-    }
-
-    lastPollAt = Date.now();
-    const seenNames = new Set();
-
-    processes = list.map(p => {
-      const memMb = Math.round(((p.monit && p.monit.memory) || 0) / 1024 / 1024);
-      const cpu = (p.monit && p.monit.cpu) || 0;
-      const name = p.name;
-      seenNames.add(name);
-
-      if (!metrics[name]) metrics[name] = [];
-      metrics[name].push({ ts: Date.now(), cpu, mem: memMb });
-      if (metrics[name].length > cfg.metricsBuffer) metrics[name].shift();
-
-      if (!cfg.ignore.has(name)) {
-        if (memMb >= cfg.memoryAlertMb) {
-          sendAlert(`\u{1F7E0} ${name} memory high: ${memMb} MB (threshold ${cfg.memoryAlertMb} MB)`, name, 'memory');
-        }
-
-        const recent = metrics[name].slice(-cfg.cpuSustainedPolls);
-        if (recent.length >= cfg.cpuSustainedPolls &&
-            recent.every(s => s.cpu >= cfg.cpuSustainedPct)) {
-          sendAlert(`\u{1F7E0} ${name} CPU sustained >= ${cfg.cpuSustainedPct}%`, name, 'cpu');
-        }
-
-        const open = history.find(h => h.name === name && !h.upAt);
-        if (open) {
-          const downMin = (Date.now() - new Date(open.downAt).getTime()) / 60000;
-          if (downMin >= cfg.escalationMin) {
-            sendAlert(`\u{1F6A8} ESCALATION: ${name} still DOWN for ${Math.round(downMin)} min`, name, 'escalation');
-          }
-        }
-      }
-
-      return {
-        id: p.pm_id,
-        name,
-        status: p.pm2_env.status,
-        uptime: p.pm2_env.pm_uptime ? Date.now() - p.pm2_env.pm_uptime : 0,
-        restarts: p.pm2_env.restart_time || 0,
-        cpu,
-        memory: memMb,
-        pid: p.pid,
-        outLog: p.pm2_env.pm_out_log_path || null,
-        errLog: p.pm2_env.pm_err_log_path || null
-      };
-    });
-
-    // Any name that has an open outage but no longer appears in `pm2 list` at all
-    // (deleted outside of a clean 'delete' bus event, e.g. daemon restart) — close it quietly.
-    history.filter(h => !h.upAt && !seenNames.has(h.name)).forEach(h => {
-      h.upAt = new Date().toISOString();
-      h.durationMs = 0;
-      h.reason = (h.reason || 'status') + ' (process no longer present)';
-      historyDirty = true;
-    });
-
-    persistHistory();
+function checkTcp(host, portNum, timeoutMs) {
+  return new Promise(resolve => {
+    const start = Date.now();
+    const socket = net.createConnection({ host, port: portNum, timeout: timeoutMs });
+    const done = ok => { socket.destroy(); resolve({ ok, latencyMs: Date.now() - start }); };
+    socket.once('connect', () => done(true));
+    socket.once('timeout', () => done(false));
+    socket.once('error', () => done(false));
   });
+}
+
+function checkHttp(host, portNum, urlPath, timeoutMs) {
+  return new Promise(resolve => {
+    const start = Date.now();
+    const req = http.get({ host, port: portNum, path: urlPath, timeout: timeoutMs }, res => {
+      const ok = res.statusCode >= 200 && res.statusCode < 400;
+      res.resume();
+      resolve({ ok, latencyMs: Date.now() - start, statusCode: res.statusCode });
+    });
+    req.on('timeout', () => { req.destroy(); resolve({ ok: false, latencyMs: Date.now() - start }); });
+    req.on('error', () => resolve({ ok: false, latencyMs: Date.now() - start }));
+  });
+}
+
+async function checkServices() {
+  if (!cfg.services.length) return;
+
+  lastPollAt = Date.now();
+
+  const results = await Promise.all(cfg.services.map(async svc => {
+    const result = svc.path
+      ? await checkHttp(svc.host, svc.port, svc.path, cfg.checkTimeoutMs)
+      : await checkTcp(svc.host, svc.port, cfg.checkTimeoutMs);
+    return { ...svc, ...result };
+  }));
+
+  services = results.map(r => ({
+    name: r.name,
+    host: r.host,
+    port: r.port,
+    path: r.path,
+    status: r.ok ? 'online' : 'stopped',
+    latencyMs: r.latencyMs,
+    statusCode: r.statusCode || null,
+    lastCheckedAt: Date.now()
+  }));
+
+  services.forEach(svc => {
+    if (svc.status === 'online') recordUp(svc.name);
+    else recordDown(svc.name, svc.path ? 'http-check-failed' : 'port-unreachable');
+  });
+
+  checkEscalations();
+  persistHistory();
 }
 
 // ────────────────────────────────────────────────
@@ -349,22 +310,15 @@ function send(res, status, body, type = 'text/html') {
 }
 
 function tailLog(name, lines = 300) {
-  const proc = processes.find(p => p.name === name);
-  const base = path.join(os.homedir(), '.pm2', 'logs');
-  const outPath = (proc && proc.outLog) || path.join(base, `${name}-out.log`);
-  const errPath = (proc && proc.errLog) || path.join(base, `${name}-error.log`);
-
-  let content = '';
-  for (const f of [errPath, outPath]) {
-    try {
-      if (f && fs.existsSync(f)) {
-        const data = fs.readFileSync(f, 'utf8').split('\n');
-        content += `\n===== ${path.basename(f)} (last ${lines} lines) =====\n`;
-        content += data.slice(-lines).join('\n');
-      }
-    } catch (_) { /* skip unreadable log */ }
+  const logPath = cfg.serviceLogs[name];
+  if (!logPath) return `No log path configured for "${name}". Add it to SERVICE_LOGS in .env, e.g.\nSERVICE_LOGS=${name}:/var/log/${name}/out.log`;
+  if (!fs.existsSync(logPath)) return `Configured log path not found on disk: ${logPath}`;
+  try {
+    const data = fs.readFileSync(logPath, 'utf8').split('\n');
+    return data.slice(-lines).join('\n');
+  } catch (e) {
+    return `Error reading log: ${e.message}`;
   }
-  return content || 'No logs found for this process.';
 }
 
 // ────────────────────────────────────────────────
@@ -375,44 +329,31 @@ function statusDotClass(status) {
 }
 
 function renderDashboard(tokenQ = '') {
-  const onlineCount = processes.filter(p => p.status === 'online').length;
-  const offlineCount = processes.length - onlineCount;
-  const totalRestarts = processes.reduce((s, p) => s + p.restarts, 0);
-  const maxMem = Math.max(...processes.map(p => p.memory), 0);
-  const avgSla = processes.length
-    ? (processes.reduce((s, p) => s + parseFloat(uptimePercent(p.name)), 0) / processes.length).toFixed(2)
+  const onlineCount = services.filter(s => s.status === 'online').length;
+  const offlineCount = services.length - onlineCount;
+  const avgSla = services.length
+    ? (services.reduce((s, svc) => s + parseFloat(uptimePercent(svc.name)), 0) / services.length).toFixed(2)
     : '100.00';
+  const avgLatency = services.length
+    ? Math.round(services.reduce((s, svc) => s + (svc.latencyMs || 0), 0) / services.length)
+    : 0;
 
-  const stale = lastPollAt && (Date.now() - lastPollAt) > cfg.checkInterval * 3;
+  const stale = lastPollAt && (Date.now() - lastPollAt) > cfg.checkIntervalMs * 3;
 
   const kpiCards = `
     <div class="kpi-grid">
       <div class="kpi">
         <div class="kpi-icon icon-online">&#9679;</div>
         <div>
-          <div class="kpi-value">${onlineCount}<span class="kpi-value-muted">/${processes.length}</span></div>
-          <div class="kpi-label">Processes Online</div>
+          <div class="kpi-value">${onlineCount}<span class="kpi-value-muted">/${services.length}</span></div>
+          <div class="kpi-label">Services Online</div>
         </div>
       </div>
       <div class="kpi">
         <div class="kpi-icon icon-offline">&#9679;</div>
         <div>
           <div class="kpi-value">${offlineCount}</div>
-          <div class="kpi-label">Processes Down</div>
-        </div>
-      </div>
-      <div class="kpi">
-        <div class="kpi-icon icon-restart">&#8635;</div>
-        <div>
-          <div class="kpi-value">${totalRestarts}</div>
-          <div class="kpi-label">Total Restarts</div>
-        </div>
-      </div>
-      <div class="kpi">
-        <div class="kpi-icon icon-mem">&#9612;</div>
-        <div>
-          <div class="kpi-value">${maxMem}<span class="kpi-value-muted">MB</span></div>
-          <div class="kpi-label">Peak Memory</div>
+          <div class="kpi-label">Services Down</div>
         </div>
       </div>
       <div class="kpi">
@@ -422,25 +363,32 @@ function renderDashboard(tokenQ = '') {
           <div class="kpi-label">Avg 7-day SLA</div>
         </div>
       </div>
+      <div class="kpi">
+        <div class="kpi-icon icon-restart">&#9889;</div>
+        <div>
+          <div class="kpi-value">${avgLatency}<span class="kpi-value-muted">ms</span></div>
+          <div class="kpi-label">Avg Latency</div>
+        </div>
+      </div>
     </div>`;
 
-  const rows = [...processes]
+  const rows = [...services]
     .sort((a, b) => (a.status === 'online' ? 1 : 0) - (b.status === 'online' ? 1 : 0) || a.name.localeCompare(b.name))
-    .map(p => {
-      const cls = p.status === 'online' ? 'online' : 'offline';
-      const ignored = cfg.ignore.has(p.name) ? ' <span class="tag-ignored">ignored</span>' : '';
+    .map(s => {
+      const cls = s.status === 'online' ? 'online' : 'offline';
+      const target = s.path ? `${s.host}:${s.port}${s.path}` : `${s.host}:${s.port}`;
+      const ignored = cfg.ignore.has(s.name) ? ' <span class="tag-ignored">ignored</span>' : '';
       return `
-        <tr class="${cls}" data-name="${escapeHtml(p.name.toLowerCase())}">
-          <td class="mono">${p.id}</td>
-          <td><span class="dot ${statusDotClass(p.status)}"></span><strong>${escapeHtml(p.name)}</strong>${ignored}</td>
-          <td><span class="badge ${cls}">${escapeHtml(p.status)}</span></td>
-          <td class="mono">${formatDuration(p.uptime)}</td>
-          <td class="mono">${uptimePercent(p.name)}%</td>
-          <td class="mono">${p.restarts}</td>
-          <td class="mono">${p.cpu}%</td>
-          <td class="mono">${p.memory} MB</td>
-          <td class="mono">${p.pid || '-'}</td>
-          <td><a class="btn" href="/logs/${encodeURIComponent(p.name)}${tokenQ}">Logs</a></td>
+        <tr class="${cls}" data-name="${escapeHtml(s.name.toLowerCase())}">
+          <td><span class="dot ${statusDotClass(s.status)}"></span><strong>${escapeHtml(s.name)}</strong>${ignored}</td>
+          <td class="mono">${escapeHtml(target)}</td>
+          <td>${s.path ? 'HTTP' : 'TCP'}</td>
+          <td><span class="badge ${cls}">${escapeHtml(s.status)}</span></td>
+          <td class="mono">${s.statusCode || '-'}</td>
+          <td class="mono">${s.latencyMs != null ? s.latencyMs + ' ms' : '-'}</td>
+          <td class="mono">${uptimePercent(s.name)}%</td>
+          <td class="mono">${s.lastCheckedAt ? new Date(s.lastCheckedAt).toLocaleTimeString() : '-'}</td>
+          <td><a class="btn" href="/logs/${encodeURIComponent(s.name)}${tokenQ}">Logs</a></td>
         </tr>`;
     }).join('');
 
@@ -454,7 +402,6 @@ function renderDashboard(tokenQ = '') {
     </tr>`).join('');
 
   const lastPoll = lastPollAt ? formatDuration(Date.now() - lastPollAt) + ' ago' : 'never';
-  const busStatus = busConnected ? 'Live' : 'Reconnecting';
   const monitorUptime = formatDuration(Date.now() - MONITOR_STARTED_AT);
   const hostname = escapeHtml(os.hostname());
 
@@ -463,161 +410,45 @@ function renderDashboard(tokenQ = '') {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>PM2 Production Monitor${stale ? ' — stale' : ''}</title>
+  <title>Service Status Monitor${stale ? ' — stale' : ''}</title>
   <meta http-equiv="refresh" content="20${tokenQ}">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22><circle cx=%2216%22 cy=%2216%22 r=%2214%22 fill=%22%2322c55e%22/></svg>">
   <style>
     :root {
-      --bg: #f3f4f8;
-      --card: #ffffff;
-      --text: #0f172a;
-      --muted: #64748b;
-      --border: #e5e7eb;
-      --accent: #4f46e5;
-      --green: #16a34a;
-      --red: #dc2626;
-      --orange: #d97706;
-      --radius: 14px;
+      --bg: #f3f4f8; --card: #ffffff; --text: #0f172a; --muted: #64748b;
+      --border: #e5e7eb; --accent: #4f46e5; --green: #16a34a; --red: #dc2626;
+      --orange: #d97706; --radius: 14px;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body { height: 100%; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      -webkit-font-smoothing: antialiased;
-    }
-    .topbar {
-      background: #0b1120;
-      color: #f8fafc;
-      padding: 16px 32px;
-      display: flex;
-      align-items: center;
-      gap: 16px;
-      position: sticky;
-      top: 0;
-      z-index: 20;
-      box-shadow: 0 2px 12px rgb(0 0 0 / 0.15);
-    }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); -webkit-font-smoothing: antialiased; }
+    .topbar { background: #0b1120; color: #f8fafc; padding: 16px 32px; display: flex; align-items: center; gap: 16px; position: sticky; top: 0; z-index: 20; box-shadow: 0 2px 12px rgb(0 0 0 / 0.15); }
     .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 1.05rem; letter-spacing: -0.01em; }
-    .brand-mark {
-      width: 26px; height: 26px; border-radius: 8px;
-      background: linear-gradient(135deg, var(--accent), #22c55e);
-      display: inline-block;
-    }
+    .brand-mark { width: 26px; height: 26px; border-radius: 8px; background: linear-gradient(135deg, var(--accent), #22c55e); display: inline-block; }
     .topbar-meta { display: flex; gap: 10px; margin-left: auto; align-items: center; flex-wrap: wrap; }
-    .pill {
-      background: rgba(255,255,255,0.08);
-      border: 1px solid rgba(255,255,255,0.12);
-      padding: 5px 12px;
-      border-radius: 999px;
-      font-size: 0.78rem;
-      color: #cbd5e1;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
-    .pill.live::before {
-      content: '';
-      width: 7px; height: 7px; border-radius: 50%;
-      background: ${busConnected ? 'var(--green)' : 'var(--orange)'};
-      ${busConnected ? 'box-shadow: 0 0 0 rgba(34,197,94,0.5); animation: pulse 1.8s infinite;' : ''}
-    }
-    @keyframes pulse {
-      0%   { box-shadow: 0 0 0 0 rgba(34,197,94,0.5); }
-      70%  { box-shadow: 0 0 0 6px rgba(34,197,94,0); }
-      100% { box-shadow: 0 0 0 0 rgba(34,197,94,0); }
-    }
-    .btn-refresh {
-      background: var(--accent);
-      color: white;
-      border: none;
-      padding: 7px 16px;
-      border-radius: 8px;
-      font-size: 0.82rem;
-      font-weight: 600;
-      text-decoration: none;
-      cursor: pointer;
-    }
+    .pill { background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.12); padding: 5px 12px; border-radius: 999px; font-size: 0.78rem; color: #cbd5e1; display: flex; align-items: center; gap: 6px; }
+    .btn-refresh { background: var(--accent); color: white; border: none; padding: 7px 16px; border-radius: 8px; font-size: 0.82rem; font-weight: 600; text-decoration: none; cursor: pointer; }
     .btn-refresh:hover { filter: brightness(1.1); }
-
     .wrap { max-width: 1320px; margin: 0 auto; padding: 28px 32px 60px; }
-    .stale-banner {
-      background: #fef3c7; color: #92400e; border: 1px solid #fde68a;
-      padding: 10px 16px; border-radius: 10px; font-size: 0.85rem; margin-bottom: 20px;
-      display: ${stale ? 'block' : 'none'};
-    }
-
-    .kpi-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-      gap: 14px;
-      margin-bottom: 28px;
-    }
-    .kpi {
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 18px 20px;
-      display: flex;
-      align-items: center;
-      gap: 14px;
-      box-shadow: 0 1px 2px rgb(0 0 0 / 0.03);
-    }
-    .kpi-icon {
-      width: 38px; height: 38px; border-radius: 10px;
-      display: flex; align-items: center; justify-content: center;
-      font-size: 1rem; flex-shrink: 0;
-    }
+    .stale-banner { background: #fef3c7; color: #92400e; border: 1px solid #fde68a; padding: 10px 16px; border-radius: 10px; font-size: 0.85rem; margin-bottom: 20px; display: ${stale ? 'block' : 'none'}; }
+    .empty-banner { display: ${cfg.services.length ? 'none' : 'block'}; background: #dbeafe; color: #1e40af; border: 1px solid #bfdbfe; padding: 10px 16px; border-radius: 10px; font-size: 0.85rem; margin-bottom: 20px; }
+    .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 14px; margin-bottom: 28px; }
+    .kpi { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px 20px; display: flex; align-items: center; gap: 14px; box-shadow: 0 1px 2px rgb(0 0 0 / 0.03); }
+    .kpi-icon { width: 38px; height: 38px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 1rem; flex-shrink: 0; }
     .icon-online  { background: #dcfce7; color: var(--green); }
     .icon-offline { background: #fee2e2; color: var(--red); }
     .icon-restart { background: #ede9fe; color: var(--accent); }
-    .icon-mem     { background: #ffedd5; color: var(--orange); }
     .icon-sla     { background: #dbeafe; color: #2563eb; }
     .kpi-value { font-size: 1.5rem; font-weight: 700; letter-spacing: -0.02em; line-height: 1.1; }
     .kpi-value-muted { font-size: 0.85rem; color: var(--muted); font-weight: 500; margin-left: 2px; }
     .kpi-label { font-size: 0.78rem; color: var(--muted); margin-top: 3px; }
-
-    .card {
-      background: var(--card);
-      border-radius: var(--radius);
-      border: 1px solid var(--border);
-      box-shadow: 0 1px 2px rgb(0 0 0 / 0.03);
-      overflow: hidden;
-    }
-    .card-header {
-      padding: 14px 20px;
-      border-bottom: 1px solid var(--border);
-      font-weight: 600;
-      font-size: 0.9rem;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-    }
-    .card-header .sub { color: var(--muted); font-weight: 400; font-size: 0.78rem; }
-    .card-body { padding: 16px 18px; }
-
-    .section-title {
-      font-size: 1rem; font-weight: 700; margin: 30px 0 12px;
-      display: flex; align-items: center; gap: 10px;
-    }
-    .filter-input {
-      margin-left: auto;
-      border: 1px solid var(--border);
-      background: var(--card);
-      padding: 7px 12px;
-      border-radius: 8px;
-      font-size: 0.82rem;
-      width: 220px;
-    }
+    .card { background: var(--card); border-radius: var(--radius); border: 1px solid var(--border); box-shadow: 0 1px 2px rgb(0 0 0 / 0.03); overflow: hidden; }
+    .section-title { font-size: 1rem; font-weight: 700; margin: 30px 0 12px; display: flex; align-items: center; gap: 10px; }
+    .filter-input { margin-left: auto; border: 1px solid var(--border); background: var(--card); padding: 7px 12px; border-radius: 8px; font-size: 0.82rem; width: 220px; }
     .filter-input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
-
     table { width: 100%; border-collapse: collapse; }
     th, td { padding: 11px 16px; text-align: left; border-bottom: 1px solid var(--border); font-size: 0.83rem; }
-    th {
-      background: #f8fafc; color: var(--muted); font-weight: 600;
-      text-transform: uppercase; font-size: 0.68rem; letter-spacing: 0.05em;
-    }
+    th { background: #f8fafc; color: var(--muted); font-weight: 600; text-transform: uppercase; font-size: 0.68rem; letter-spacing: 0.05em; }
     tbody tr:hover td { background: #f8fafc; }
     tr.offline td { background: #fef2f2; }
     tr.offline:hover td { background: #fde8e8; }
@@ -628,15 +459,9 @@ function renderDashboard(tokenQ = '') {
     .badge { padding: 3px 10px; border-radius: 999px; font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; }
     .badge.online  { background: #dcfce7; color: #166534; }
     .badge.offline { background: #fee2e2; color: #991b1b; }
-    .tag-ignored {
-      font-size: 0.68rem; color: var(--muted); background: #f1f5f9;
-      padding: 1px 7px; border-radius: 999px; margin-left: 6px; font-weight: 500;
-    }
+    .tag-ignored { font-size: 0.68rem; color: var(--muted); background: #f1f5f9; padding: 1px 7px; border-radius: 999px; margin-left: 6px; font-weight: 500; }
     .still-down { color: var(--red); font-style: italic; }
-    .btn {
-      display: inline-block; padding: 5px 13px; background: var(--accent); color: white;
-      border-radius: 7px; text-decoration: none; font-size: 0.78rem; font-weight: 600;
-    }
+    .btn { display: inline-block; padding: 5px 13px; background: var(--accent); color: white; border-radius: 7px; text-decoration: none; font-size: 0.78rem; font-weight: 600; }
     .btn:hover { filter: brightness(1.08); }
     .empty { text-align: center; color: var(--muted); padding: 44px; font-size: 0.88rem; }
     footer { text-align: center; color: var(--muted); font-size: 0.75rem; padding: 30px 0 10px; }
@@ -644,44 +469,41 @@ function renderDashboard(tokenQ = '') {
 </head>
 <body>
   <div class="topbar">
-    <div class="brand"><span class="brand-mark"></span> PM2 Production Monitor</div>
+    <div class="brand"><span class="brand-mark"></span> Service Status Monitor</div>
     <div class="topbar-meta">
       <span class="pill">${hostname}</span>
       <span class="pill">Monitor up ${monitorUptime}</span>
-      <span class="pill">Last poll ${lastPoll}</span>
-      <span class="pill live">Event bus: ${busStatus}</span>
+      <span class="pill">Last check ${lastPoll}</span>
       <a href="/${tokenQ}" class="btn-refresh">Refresh</a>
     </div>
   </div>
 
   <div class="wrap">
-    <div class="stale-banner">&#9888; No successful poll in a while — the monitor process itself may be stalled or PM2 is unreachable.</div>
+    <div class="stale-banner">&#9888; No successful check in a while — the monitor process may be stalled.</div>
+    <div class="empty-banner">&#8505; <strong>SERVICES is empty in .env</strong> — nothing is being monitored yet. Add entries like <code>name:host:port</code> and restart.</div>
 
     ${kpiCards}
 
     <div class="section-title">
-      Processes
+      Services
       <input class="filter-input" id="filterInput" type="text" placeholder="Filter by name...">
     </div>
     <div class="card">
-      <table id="procTable">
+      <table id="svcTable">
         <thead>
-          <tr>
-            <th>ID</th><th>Name</th><th>Status</th><th>Uptime</th>
-            <th>7d SLA</th><th>Restarts</th><th>CPU</th><th>Memory</th><th>PID</th><th></th>
-          </tr>
+          <tr><th>Name</th><th>Target</th><th>Check</th><th>Status</th><th>HTTP</th><th>Latency</th><th>7d SLA</th><th>Last Checked</th><th></th></tr>
         </thead>
         <tbody>
-          ${rows || '<tr><td colspan="10" class="empty">No processes found</td></tr>'}
+          ${rows || '<tr><td colspan="9" class="empty">No services configured</td></tr>'}
         </tbody>
       </table>
     </div>
 
-    <div class="section-title">Recent Downtime &amp; Restarts</div>
+    <div class="section-title">Recent Downtime</div>
     <div class="card">
       <table>
         <thead>
-          <tr><th>Process</th><th>Down at</th><th>Up at</th><th>Duration</th><th>Reason</th></tr>
+          <tr><th>Service</th><th>Down at</th><th>Up at</th><th>Duration</th><th>Reason</th></tr>
         </thead>
         <tbody>
           ${histRows || '<tr><td colspan="5" class="empty">No events recorded yet</td></tr>'}
@@ -689,13 +511,13 @@ function renderDashboard(tokenQ = '') {
       </table>
     </div>
 
-    <footer>PM2 Production Monitor &middot; <a href="/health${tokenQ}" style="color:inherit">health</a> &middot; <a href="/api/status${tokenQ}" style="color:inherit">raw json</a></footer>
+    <footer>Service Status Monitor &middot; <a href="/health${tokenQ}" style="color:inherit">health</a> &middot; <a href="/api/status${tokenQ}" style="color:inherit">raw json</a></footer>
   </div>
 
   <script>
     document.getElementById('filterInput').addEventListener('input', e => {
       const q = e.target.value.toLowerCase();
-      document.querySelectorAll('#procTable tbody tr').forEach(row => {
+      document.querySelectorAll('#svcTable tbody tr').forEach(row => {
         const name = row.dataset.name || '';
         row.style.display = name.includes(q) ? '' : 'none';
       });
@@ -714,11 +536,7 @@ function renderLogsPage(name, content, tokenQ) {
   <title>Logs - ${escapeHtml(name)}</title>
   <style>
     body { margin: 0; font-family: ui-monospace, 'SF Mono', Menlo, monospace; background: #0b1120; color: #e2e8f0; }
-    header {
-      background: #111827; padding: 14px 24px; display: flex; align-items: center; gap: 16px;
-      border-bottom: 1px solid #1f2937; position: sticky; top: 0; z-index: 10;
-      font-family: -apple-system, system-ui, sans-serif;
-    }
+    header { background: #111827; padding: 14px 24px; display: flex; align-items: center; gap: 16px; border-bottom: 1px solid #1f2937; position: sticky; top: 0; z-index: 10; font-family: -apple-system, system-ui, sans-serif; }
     h1 { font-size: 1rem; margin: 0; font-weight: 600; }
     a.back { color: #818cf8; text-decoration: none; font-size: 0.85rem; }
     pre { margin: 0; padding: 22px 24px; font-size: 12.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-all; }
@@ -751,21 +569,21 @@ const server = http.createServer((req, res) => {
 
   if (url.pathname === '/api/status') {
     return send(res, 200, JSON.stringify({
-      processes, history: history.slice(0, 50), lastPollAt, busConnected
+      services, history: history.slice(0, 50), lastPollAt
     }, null, 2), 'application/json');
   }
 
   if (url.pathname === '/health') {
-    const stale = lastPollAt && (Date.now() - lastPollAt) > cfg.checkInterval * 3;
-    const hasPolled = lastPollAt !== null;
+    const stale = lastPollAt && (Date.now() - lastPollAt) > cfg.checkIntervalMs * 3;
+    const hasPolled = cfg.services.length === 0 || lastPollAt !== null;
     const allOnline = hasPolled && !stale &&
-      processes.every(p => p.status === 'online' || cfg.ignore.has(p.name));
+      services.every(s => s.status === 'online' || cfg.ignore.has(s.name));
     const body = {
       status: allOnline ? 'ok' : 'degraded',
+      configured: cfg.services.length,
       polled: hasPolled,
       stale: !!stale,
-      busConnected,
-      downProcesses: processes.filter(p => p.status !== 'online' && !cfg.ignore.has(p.name)).map(p => p.name)
+      downServices: services.filter(s => s.status !== 'online' && !cfg.ignore.has(s.name)).map(s => s.name)
     };
     return send(res, allOnline ? 200 : 503, JSON.stringify(body, null, 2), 'application/json');
   }
@@ -786,29 +604,23 @@ function shutdown(sig) {
   log(`Received ${sig}, saving state and exiting...`);
   historyDirty = true;
   persistHistory();
-  server.close(() => {
-    try { pm2.disconnect(); } catch (_) { /* already down */ }
-    process.exit(0);
-  });
+  server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 2000).unref();
 }
 process.on('SIGINT',  () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 
 // ────────────────────────────────────────────────
-// Start — single persistent PM2 connection for both bus + polling
+// Start
 // ────────────────────────────────────────────────
-server.listen(cfg.port, '0.0.0.0', () => {
-  log(`Dashboard listening on http://0.0.0.0:${cfg.port}${cfg.accessToken ? ' (token required)' : ''}`);
+server.listen(cfg.port, '127.0.0.1', () => {
+  log(`Dashboard listening on http://127.0.0.1:${cfg.port}${cfg.accessToken ? ' (token required)' : ''}`);
 });
 
-pm2.connect(err => {
-  if (err) {
-    log('Fatal: PM2 connect error: ' + err.message);
-    process.exit(1);
-  }
-  pm2ConnectionReady = true;
-  startBus();
-  pollMetrics();
-  setInterval(pollMetrics, cfg.checkInterval);
-});
+if (cfg.services.length) {
+  log(`Watching: ${cfg.services.map(s => `${s.name} (${s.host}:${s.port}${s.path || ''})`).join(', ')}`);
+  checkServices();
+  setInterval(checkServices, cfg.checkIntervalMs);
+} else {
+  log('No services configured. Set SERVICES in .env, e.g. SERVICES=api:127.0.0.1:4000,web:127.0.0.1:3000:/health');
+}
