@@ -345,28 +345,28 @@ function renderDashboard(tokenQ = '') {
       <div class="kpi">
         <div class="kpi-icon icon-online">&#9679;</div>
         <div>
-          <div class="kpi-value">${onlineCount}<span class="kpi-value-muted">/${services.length}</span></div>
+          <div class="kpi-value" id="kpiOnline">${onlineCount}<span class="kpi-value-muted">/${services.length}</span></div>
           <div class="kpi-label">Services Online</div>
         </div>
       </div>
       <div class="kpi">
         <div class="kpi-icon icon-offline">&#9679;</div>
         <div>
-          <div class="kpi-value">${offlineCount}</div>
+          <div class="kpi-value" id="kpiOffline">${offlineCount}</div>
           <div class="kpi-label">Services Down</div>
         </div>
       </div>
       <div class="kpi">
         <div class="kpi-icon icon-sla">&#10003;</div>
         <div>
-          <div class="kpi-value">${avgSla}<span class="kpi-value-muted">%</span></div>
+          <div class="kpi-value" id="kpiSla">${avgSla}<span class="kpi-value-muted">%</span></div>
           <div class="kpi-label">Avg 7-day SLA</div>
         </div>
       </div>
       <div class="kpi">
         <div class="kpi-icon icon-restart">&#9889;</div>
         <div>
-          <div class="kpi-value">${avgLatency}<span class="kpi-value-muted">ms</span></div>
+          <div class="kpi-value" id="kpiLatency">${avgLatency}<span class="kpi-value-muted">ms</span></div>
           <div class="kpi-label">Avg Latency</div>
         </div>
       </div>
@@ -411,7 +411,6 @@ function renderDashboard(tokenQ = '') {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Service Status Monitor${stale ? ' — stale' : ''}</title>
-  <meta http-equiv="refresh" content="20${tokenQ}">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22><circle cx=%2216%22 cy=%2216%22 r=%2214%22 fill=%22%2322c55e%22/></svg>">
   <style>
     :root {
@@ -473,13 +472,13 @@ function renderDashboard(tokenQ = '') {
     <div class="topbar-meta">
       <span class="pill">${hostname}</span>
       <span class="pill">Monitor up ${monitorUptime}</span>
-      <span class="pill">Last check ${lastPoll}</span>
+      <span class="pill" id="lastCheckPill">Last check ${lastPoll}</span>
       <a href="/${tokenQ}" class="btn-refresh">Refresh</a>
     </div>
   </div>
 
   <div class="wrap">
-    <div class="stale-banner">&#9888; No successful check in a while — the monitor process may be stalled.</div>
+    <div class="stale-banner" id="staleBanner">&#9888; No successful check in a while — the monitor process may be stalled.</div>
     <div class="empty-banner">&#8505; <strong>SERVICES is empty in .env</strong> — nothing is being monitored yet. Add entries like <code>name:host:port</code> and restart.</div>
 
     ${kpiCards}
@@ -493,7 +492,7 @@ function renderDashboard(tokenQ = '') {
         <thead>
           <tr><th>Name</th><th>Target</th><th>Check</th><th>Status</th><th>HTTP</th><th>Latency</th><th>7d SLA</th><th>Last Checked</th><th></th></tr>
         </thead>
-        <tbody>
+        <tbody id="svcTableBody">
           ${rows || '<tr><td colspan="9" class="empty">No services configured</td></tr>'}
         </tbody>
       </table>
@@ -505,7 +504,7 @@ function renderDashboard(tokenQ = '') {
         <thead>
           <tr><th>Service</th><th>Down at</th><th>Up at</th><th>Duration</th><th>Reason</th></tr>
         </thead>
-        <tbody>
+        <tbody id="histTableBody">
           ${histRows || '<tr><td colspan="5" class="empty">No events recorded yet</td></tr>'}
         </tbody>
       </table>
@@ -515,13 +514,105 @@ function renderDashboard(tokenQ = '') {
   </div>
 
   <script>
-    document.getElementById('filterInput').addEventListener('input', e => {
-      const q = e.target.value.toLowerCase();
-      document.querySelectorAll('#svcTable tbody tr').forEach(row => {
-        const name = row.dataset.name || '';
-        row.style.display = name.includes(q) ? '' : 'none';
+    var TOKEN_QS = '${tokenQ}';
+    var POLL_MS = ${Math.max(3000, cfg.checkIntervalMs)};
+
+    function escapeHtml(str) {
+      return String(str == null ? '' : str).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
       });
-    });
+    }
+
+    function fmtDuration(ms) {
+      if (ms == null) return '-';
+      if (ms < 1000) return ms + ' ms';
+      var s = Math.floor(ms / 1000);
+      if (s < 60) return s + ' s';
+      var m = Math.floor(s / 60);
+      if (m < 60) return m + 'm ' + (s % 60) + 's';
+      var h = Math.floor(m / 60);
+      return h + 'h ' + (m % 60) + 'm';
+    }
+
+    function renderSvcRow(s) {
+      var cls = s.status === 'online' ? 'online' : 'offline';
+      var target = s.path ? (s.host + ':' + s.port + s.path) : (s.host + ':' + s.port);
+      var ignoredTag = s.ignored ? ' <span class="tag-ignored">ignored</span>' : '';
+      var lastChecked = s.lastCheckedAt ? new Date(s.lastCheckedAt).toLocaleTimeString() : '-';
+      return '<tr class="' + cls + '" data-name="' + escapeHtml(s.name.toLowerCase()) + '">' +
+        '<td><span class="dot ' + (s.status === 'online' ? 'dot-online' : 'dot-offline') + '"></span><strong>' + escapeHtml(s.name) + '</strong>' + ignoredTag + '</td>' +
+        '<td class="mono">' + escapeHtml(target) + '</td>' +
+        '<td>' + (s.path ? 'HTTP' : 'TCP') + '</td>' +
+        '<td><span class="badge ' + cls + '">' + escapeHtml(s.status) + '</span></td>' +
+        '<td class="mono">' + (s.statusCode || '-') + '</td>' +
+        '<td class="mono">' + (s.latencyMs != null ? s.latencyMs + ' ms' : '-') + '</td>' +
+        '<td class="mono">' + s.slaPercent + '%</td>' +
+        '<td class="mono">' + lastChecked + '</td>' +
+        '<td><a class="btn" href="/logs/' + encodeURIComponent(s.name) + TOKEN_QS + '">Logs</a></td>' +
+      '</tr>';
+    }
+
+    function renderHistRow(h) {
+      var upCell = h.upAt ? new Date(h.upAt).toLocaleString() : '<span class="still-down">still down</span>';
+      return '<tr>' +
+        '<td><strong>' + escapeHtml(h.name) + '</strong></td>' +
+        '<td class="mono">' + new Date(h.downAt).toLocaleString() + '</td>' +
+        '<td class="mono">' + upCell + '</td>' +
+        '<td class="mono">' + (h.durationMs != null ? fmtDuration(h.durationMs) : '-') + '</td>' +
+        '<td>' + escapeHtml(h.reason || 'status') + '</td>' +
+      '</tr>';
+    }
+
+    function applyFilter() {
+      var q = (document.getElementById('filterInput').value || '').toLowerCase();
+      document.querySelectorAll('#svcTable tbody tr').forEach(function (row) {
+        var name = row.dataset.name || '';
+        row.style.display = name.indexOf(q) !== -1 ? '' : 'none';
+      });
+    }
+
+    async function refreshStatus() {
+      try {
+        var res = await fetch('/api/status' + TOKEN_QS, { cache: 'no-store' });
+        if (!res.ok) return;
+        var data = await res.json();
+
+        var total = data.services.length;
+        var onlineCount = data.services.filter(function (s) { return s.status === 'online'; }).length;
+        var offlineCount = total - onlineCount;
+        var avgSla = total ? (data.services.reduce(function (sum, s) { return sum + parseFloat(s.slaPercent); }, 0) / total).toFixed(2) : '100.00';
+        var avgLatency = total ? Math.round(data.services.reduce(function (sum, s) { return sum + (s.latencyMs || 0); }, 0) / total) : 0;
+
+        document.getElementById('kpiOnline').innerHTML = onlineCount + '<span class="kpi-value-muted">/' + total + '</span>';
+        document.getElementById('kpiOffline').textContent = offlineCount;
+        document.getElementById('kpiSla').innerHTML = avgSla + '<span class="kpi-value-muted">%</span>';
+        document.getElementById('kpiLatency').innerHTML = avgLatency + '<span class="kpi-value-muted">ms</span>';
+
+        if (data.services.length) {
+          var sorted = data.services.slice().sort(function (a, b) {
+            return (a.status === 'online' ? 1 : 0) - (b.status === 'online' ? 1 : 0) || a.name.localeCompare(b.name);
+          });
+          document.getElementById('svcTableBody').innerHTML = sorted.map(renderSvcRow).join('');
+          applyFilter();
+        }
+
+        if (data.history.length) {
+          document.getElementById('histTableBody').innerHTML = data.history.map(renderHistRow).join('');
+        }
+
+        if (data.lastPollAt) {
+          document.getElementById('lastCheckPill').textContent = 'Last check ' + fmtDuration(Date.now() - data.lastPollAt) + ' ago';
+          var stale = (Date.now() - data.lastPollAt) > data.staleMs;
+          document.getElementById('staleBanner').style.display = stale ? 'block' : 'none';
+        }
+      } catch (e) {
+        // Network hiccup fetching /api/status — keep last known state on screen, retry next tick.
+      }
+    }
+
+    document.getElementById('filterInput').addEventListener('input', applyFilter);
+    refreshStatus();
+    setInterval(refreshStatus, POLL_MS);
   </script>
 </body>
 </html>`;
@@ -569,7 +660,10 @@ const server = http.createServer((req, res) => {
 
   if (url.pathname === '/api/status') {
     return send(res, 200, JSON.stringify({
-      services, history: history.slice(0, 50), lastPollAt
+      services: services.map(s => ({ ...s, slaPercent: uptimePercent(s.name), ignored: cfg.ignore.has(s.name) })),
+      history: history.slice(0, 30),
+      lastPollAt,
+      staleMs: cfg.checkIntervalMs * 3
     }, null, 2), 'application/json');
   }
 
