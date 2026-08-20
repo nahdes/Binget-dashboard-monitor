@@ -9,6 +9,7 @@ const net = require('net');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { execFile } = require('child_process');
 const { URL } = require('url');
 
 let nodemailer = null;
@@ -262,6 +263,23 @@ function checkHttp(host, portNum, urlPath, timeoutMs) {
   });
 }
 
+// Best-effort ICMP ping — only invoked on a failed check, to tell "network/VPN down"
+// apart from "app itself is down but host is reachable". Never blocks the main check
+// loop for long: bounded timeout. Returns true/false when it actually got an answer,
+// or null if `ping` itself isn't available/permitted — callers must NOT treat null as "down".
+function pingHost(host, timeoutSec) {
+  return new Promise(resolve => {
+    const isWin = process.platform === 'win32';
+    const args = isWin
+      ? ['-n', '1', '-w', String(timeoutSec * 1000), host]
+      : ['-c', '1', '-W', String(timeoutSec), host];
+    execFile('ping', args, { timeout: (timeoutSec + 1) * 1000 }, err => {
+      if (err && err.code === 'ENOENT') return resolve(null); // ping binary not installed/on PATH
+      resolve(!err);
+    });
+  });
+}
+
 async function checkServices() {
   if (!cfg.services.length) return;
 
@@ -271,7 +289,24 @@ async function checkServices() {
     const result = svc.path
       ? await checkHttp(svc.host, svc.port, svc.path, cfg.checkTimeoutMs)
       : await checkTcp(svc.host, svc.port, cfg.checkTimeoutMs);
-    return { ...svc, ...result };
+
+    let network = null;   // only diagnosed on failure; null = n/a (service is online)
+    let reason = svc.path ? 'http-check-failed' : 'port-unreachable';
+
+    if (!result.ok) {
+      const hostReachable = await pingHost(svc.host, 2);
+      if (hostReachable === null) {
+        network = 'unknown';
+        reason = `${reason} (ping unavailable to diagnose — install iputils-ping)`;
+      } else {
+        network = hostReachable ? 'host-reachable' : 'host-unreachable';
+        reason = hostReachable
+          ? `${reason} (host up — app/port is down)`
+          : 'host-unreachable (network/VPN path down)';
+      }
+    }
+
+    return { ...svc, ...result, network, reason };
   }));
 
   services = results.map(r => ({
@@ -282,12 +317,13 @@ async function checkServices() {
     status: r.ok ? 'online' : 'stopped',
     latencyMs: r.latencyMs,
     statusCode: r.statusCode || null,
+    network: r.network,
     lastCheckedAt: Date.now()
   }));
 
-  services.forEach(svc => {
-    if (svc.status === 'online') recordUp(svc.name);
-    else recordDown(svc.name, svc.path ? 'http-check-failed' : 'port-unreachable');
+  results.forEach(r => {
+    if (r.ok) recordUp(r.name);
+    else recordDown(r.name, r.reason);
   });
 
   checkEscalations();
@@ -326,6 +362,14 @@ function tailLog(name, lines = 300) {
 // ────────────────────────────────────────────────
 function statusDotClass(status) {
   return status === 'online' ? 'dot-online' : 'dot-offline';
+}
+
+function networkTag(s) {
+  if (s.status === 'online' || !s.network) return '';
+  if (s.network === 'unknown') return ' <span class="tag-net net-unknown">ping n/a</span>';
+  return s.network === 'host-unreachable'
+    ? ' <span class="tag-net net-bad">network/VPN down</span>'
+    : ' <span class="tag-net net-ok">host up, app down</span>';
 }
 
 function renderDashboard(tokenQ = '') {
@@ -383,7 +427,7 @@ function renderDashboard(tokenQ = '') {
           <td><span class="dot ${statusDotClass(s.status)}"></span><strong>${escapeHtml(s.name)}</strong>${ignored}</td>
           <td class="mono">${escapeHtml(target)}</td>
           <td>${s.path ? 'HTTP' : 'TCP'}</td>
-          <td><span class="badge ${cls}">${escapeHtml(s.status)}</span></td>
+          <td><span class="badge ${cls}">${escapeHtml(s.status)}</span>${networkTag(s)}</td>
           <td class="mono">${s.statusCode || '-'}</td>
           <td class="mono">${s.latencyMs != null ? s.latencyMs + ' ms' : '-'}</td>
           <td class="mono">${uptimePercent(s.name)}%</td>
@@ -459,6 +503,10 @@ function renderDashboard(tokenQ = '') {
     .badge.online  { background: #dcfce7; color: #166534; }
     .badge.offline { background: #fee2e2; color: #991b1b; }
     .tag-ignored { font-size: 0.68rem; color: var(--muted); background: #f1f5f9; padding: 1px 7px; border-radius: 999px; margin-left: 6px; font-weight: 500; }
+    .tag-net { font-size: 0.68rem; padding: 2px 8px; border-radius: 999px; margin-left: 6px; font-weight: 600; }
+    .tag-net.net-bad { background: #fee2e2; color: #991b1b; }
+    .tag-net.net-ok  { background: #ffedd5; color: #9a3412; }
+    .tag-net.net-unknown { background: #e5e7eb; color: #374151; }
     .still-down { color: var(--red); font-style: italic; }
     .btn { display: inline-block; padding: 5px 13px; background: var(--accent); color: white; border-radius: 7px; text-decoration: none; font-size: 0.78rem; font-weight: 600; }
     .btn:hover { filter: brightness(1.08); }
@@ -534,6 +582,14 @@ function renderDashboard(tokenQ = '') {
       return h + 'h ' + (m % 60) + 'm';
     }
 
+    function networkTag(s) {
+      if (s.status === 'online' || !s.network) return '';
+      if (s.network === 'unknown') return ' <span class="tag-net net-unknown">ping n/a</span>';
+      return s.network === 'host-unreachable'
+        ? ' <span class="tag-net net-bad">network/VPN down</span>'
+        : ' <span class="tag-net net-ok">host up, app down</span>';
+    }
+
     function renderSvcRow(s) {
       var cls = s.status === 'online' ? 'online' : 'offline';
       var target = s.path ? (s.host + ':' + s.port + s.path) : (s.host + ':' + s.port);
@@ -543,7 +599,7 @@ function renderDashboard(tokenQ = '') {
         '<td><span class="dot ' + (s.status === 'online' ? 'dot-online' : 'dot-offline') + '"></span><strong>' + escapeHtml(s.name) + '</strong>' + ignoredTag + '</td>' +
         '<td class="mono">' + escapeHtml(target) + '</td>' +
         '<td>' + (s.path ? 'HTTP' : 'TCP') + '</td>' +
-        '<td><span class="badge ' + cls + '">' + escapeHtml(s.status) + '</span></td>' +
+        '<td><span class="badge ' + cls + '">' + escapeHtml(s.status) + '</span>' + networkTag(s) + '</td>' +
         '<td class="mono">' + (s.statusCode || '-') + '</td>' +
         '<td class="mono">' + (s.latencyMs != null ? s.latencyMs + ' ms' : '-') + '</td>' +
         '<td class="mono">' + s.slaPercent + '%</td>' +
