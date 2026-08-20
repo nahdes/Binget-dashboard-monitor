@@ -62,6 +62,17 @@ const cfg = {
       const idx = entry.indexOf(':');
       if (idx > 0) map[entry.slice(0, idx)] = entry.slice(idx + 1);
       return map;
+    }, {}),
+  // SERVICE_GROUPS format: name:group, comma-separated. Groups the dashboard into labeled sections
+  // (e.g. UAT / Production / Infrastructure). Anything not listed falls into "Other".
+  serviceGroups: (process.env.SERVICE_GROUPS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+    .reduce((map, entry) => {
+      const idx = entry.indexOf(':');
+      if (idx > 0) map[entry.slice(0, idx)] = entry.slice(idx + 1);
+      return map;
     }, {})
 };
 
@@ -115,6 +126,7 @@ function persistHistory() {
 
 function formatDuration(ms) {
   if (ms == null) return '-';
+  if (ms < 0) ms = 0; // clock skew between processes/clients can otherwise produce a negative value
   if (ms < 1000) return ms + ' ms';
   const s = Math.floor(ms / 1000);
   if (s < 60) return s + ' s';
@@ -336,6 +348,7 @@ async function checkServices() {
     statusCode: r.statusCode || null,
     network: r.network,
     failStreak: failStreaks[r.name] || 0,
+    group: cfg.serviceGroups[r.name] || 'Other',
     lastCheckedAt: Date.now()
   }));
 
@@ -446,28 +459,62 @@ function renderDashboard(tokenQ = '') {
       </div>
     </div>`;
 
-  const statusRank = { stopped: 0, degraded: 1, online: 2 };
-  const rowClass = status => status === 'online' ? 'online' : status === 'degraded' ? 'degraded' : 'offline';
+function statusRankOf(status) {
+  return { stopped: 0, degraded: 1, online: 2 }[status] ?? 1;
+}
 
-  const rows = [...services]
-    .sort((a, b) => (statusRank[a.status] ?? 1) - (statusRank[b.status] ?? 1) || a.name.localeCompare(b.name))
-    .map(s => {
-      const cls = rowClass(s.status);
-      const target = s.path ? `${s.host}:${s.port}${s.path}` : `${s.host}:${s.port}`;
-      const ignored = cfg.ignore.has(s.name) ? ' <span class="tag-ignored">ignored</span>' : '';
-      return `
-        <tr class="${cls}" data-name="${escapeHtml(s.name.toLowerCase())}">
-          <td><span class="dot ${statusDotClass(s.status)}"></span><strong>${escapeHtml(s.name)}</strong>${ignored}</td>
-          <td class="mono">${escapeHtml(target)}</td>
-          <td>${s.path ? 'HTTP' : 'TCP'}</td>
-          <td><span class="badge ${cls}">${escapeHtml(s.status)}</span>${networkTag(s)}</td>
-          <td class="mono">${s.statusCode || '-'}</td>
-          <td class="mono">${s.latencyMs != null ? s.latencyMs + ' ms' : '-'}</td>
-          <td class="mono">${uptimePercent(s.name)}%</td>
-          <td class="mono">${s.lastCheckedAt ? new Date(s.lastCheckedAt).toLocaleTimeString() : '-'}</td>
-          <td><a class="btn" href="/logs/${encodeURIComponent(s.name)}${tokenQ}">Logs</a></td>
-        </tr>`;
-    }).join('');
+function rowClassOf(status) {
+  return status === 'online' ? 'online' : status === 'degraded' ? 'degraded' : 'offline';
+}
+
+function sanitizeGroupId(group) {
+  return 'grp-' + String(group).toLowerCase().replace(/[^a-z0-9]+/g, '-');
+}
+
+function renderSvcRowServer(s, tokenQ) {
+  const cls = rowClassOf(s.status);
+  const target = s.path ? `${s.host}:${s.port}${s.path}` : `${s.host}:${s.port}`;
+  const ignored = cfg.ignore.has(s.name) ? ' <span class="tag-ignored">ignored</span>' : '';
+  return `
+    <tr class="${cls}" data-name="${escapeHtml(s.name.toLowerCase())}">
+      <td><span class="dot ${statusDotClass(s.status)}"></span><strong>${escapeHtml(s.name)}</strong>${ignored}</td>
+      <td class="mono">${escapeHtml(target)}</td>
+      <td>${s.path ? 'HTTP' : 'TCP'}</td>
+      <td><span class="badge ${cls}">${escapeHtml(s.status)}</span>${networkTag(s)}</td>
+      <td class="mono">${s.statusCode || '-'}</td>
+      <td class="mono">${s.latencyMs != null ? s.latencyMs + ' ms' : '-'}</td>
+      <td class="mono">${uptimePercent(s.name)}%</td>
+      <td class="mono">${s.lastCheckedAt ? new Date(s.lastCheckedAt).toLocaleTimeString() : '-'}</td>
+      <td><a class="btn" href="/logs/${encodeURIComponent(s.name)}${tokenQ}">Logs</a></td>
+    </tr>`;
+}
+
+  const GROUP_ORDER = ['Production', 'UAT', 'Infrastructure'];
+  const presentGroups = Array.from(new Set(services.map(s => s.group)));
+  const orderedGroups = [
+    ...GROUP_ORDER.filter(g => presentGroups.includes(g)),
+    ...presentGroups.filter(g => !GROUP_ORDER.includes(g))
+  ];
+
+  const groupSectionsHtml = orderedGroups.map(group => {
+    const groupServices = services
+      .filter(s => s.group === group)
+      .sort((a, b) => statusRankOf(a.status) - statusRankOf(b.status) || a.name.localeCompare(b.name));
+    const gid = sanitizeGroupId(group);
+    const groupRows = groupServices.map(s => renderSvcRowServer(s, tokenQ)).join('');
+    return `
+    <div class="section-title">${escapeHtml(group)} <span class="sub">${groupServices.length} service${groupServices.length === 1 ? '' : 's'}</span></div>
+    <div class="card">
+      <table class="svc-table" data-group="${gid}">
+        <thead>
+          <tr><th>Name</th><th>Target</th><th>Check</th><th>Status</th><th>HTTP</th><th>Latency</th><th>7d SLA</th><th>Last Checked</th><th></th></tr>
+        </thead>
+        <tbody id="svcBody-${gid}">
+          ${groupRows || '<tr><td colspan="9" class="empty">No services in this group</td></tr>'}
+        </tbody>
+      </table>
+    </div>`;
+  }).join('');
 
   const histRows = history.slice(0, 30).map(h => `
     <tr>
@@ -521,6 +568,7 @@ function renderDashboard(tokenQ = '') {
     .kpi-label { font-size: 0.78rem; color: var(--muted); margin-top: 3px; }
     .card { background: var(--card); border-radius: var(--radius); border: 1px solid var(--border); box-shadow: 0 1px 2px rgb(0 0 0 / 0.03); overflow: hidden; }
     .section-title { font-size: 1rem; font-weight: 700; margin: 30px 0 12px; display: flex; align-items: center; gap: 10px; }
+    .section-title .sub { font-weight: 400; font-size: 0.78rem; color: var(--muted); }
     .filter-input { margin-left: auto; border: 1px solid var(--border); background: var(--card); padding: 7px 12px; border-radius: 8px; font-size: 0.82rem; width: 220px; }
     .filter-input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
     table { width: 100%; border-collapse: collapse; }
@@ -570,19 +618,10 @@ function renderDashboard(tokenQ = '') {
     ${kpiCards}
 
     <div class="section-title">
-      Services
+      Services by Environment
       <input class="filter-input" id="filterInput" type="text" placeholder="Filter by name...">
     </div>
-    <div class="card">
-      <table id="svcTable">
-        <thead>
-          <tr><th>Name</th><th>Target</th><th>Check</th><th>Status</th><th>HTTP</th><th>Latency</th><th>7d SLA</th><th>Last Checked</th><th></th></tr>
-        </thead>
-        <tbody id="svcTableBody">
-          ${rows || '<tr><td colspan="9" class="empty">No services configured</td></tr>'}
-        </tbody>
-      </table>
-    </div>
+    ${groupSectionsHtml || '<div class="card"><div class="empty">No services configured</div></div>'}
 
     <div class="section-title">Recent Downtime</div>
     <div class="card">
@@ -611,6 +650,7 @@ function renderDashboard(tokenQ = '') {
 
     function fmtDuration(ms) {
       if (ms == null) return '-';
+      if (ms < 0) ms = 0; // clock skew between server and browser can otherwise produce a negative value
       if (ms < 1000) return ms + ' ms';
       var s = Math.floor(ms / 1000);
       if (s < 60) return s + ' s';
@@ -668,9 +708,13 @@ function renderDashboard(tokenQ = '') {
       '</tr>';
     }
 
+    function sanitizeGroupId(group) {
+      return 'grp-' + String(group).toLowerCase().replace(/[^a-z0-9]+/g, '-');
+    }
+
     function applyFilter() {
       var q = (document.getElementById('filterInput').value || '').toLowerCase();
-      document.querySelectorAll('#svcTable tbody tr').forEach(function (row) {
+      document.querySelectorAll('.svc-table tbody tr').forEach(function (row) {
         var name = row.dataset.name || '';
         row.style.display = name.indexOf(q) !== -1 ? '' : 'none';
       });
@@ -697,12 +741,21 @@ function renderDashboard(tokenQ = '') {
 
         if (data.services.length) {
           var statusRank = { stopped: 0, degraded: 1, online: 2 };
-          var sorted = data.services.slice().sort(function (a, b) {
-            var ra = statusRank.hasOwnProperty(a.status) ? statusRank[a.status] : 1;
-            var rb = statusRank.hasOwnProperty(b.status) ? statusRank[b.status] : 1;
-            return ra - rb || a.name.localeCompare(b.name);
+          var byGroup = {};
+          data.services.forEach(function (s) {
+            var g = s.group || 'Other';
+            (byGroup[g] = byGroup[g] || []).push(s);
           });
-          document.getElementById('svcTableBody').innerHTML = sorted.map(renderSvcRow).join('');
+          Object.keys(byGroup).forEach(function (g) {
+            var tbody = document.getElementById('svcBody-' + sanitizeGroupId(g));
+            if (!tbody) return; // group didn't exist at initial render (SERVICES changed without restart) — skip rather than break
+            var sorted = byGroup[g].slice().sort(function (a, b) {
+              var ra = statusRank.hasOwnProperty(a.status) ? statusRank[a.status] : 1;
+              var rb = statusRank.hasOwnProperty(b.status) ? statusRank[b.status] : 1;
+              return ra - rb || a.name.localeCompare(b.name);
+            });
+            tbody.innerHTML = sorted.map(renderSvcRow).join('');
+          });
           applyFilter();
         }
 
