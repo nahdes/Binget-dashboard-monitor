@@ -22,6 +22,7 @@ const cfg = {
   port: parseInt(process.env.PORT || '3099', 10),
   checkIntervalMs: parseInt(process.env.CHECK_INTERVAL_MS || '10000', 10),
   checkTimeoutMs: parseInt(process.env.CHECK_TIMEOUT_MS || '3000', 10),
+  failureThreshold: parseInt(process.env.FAILURE_THRESHOLD || '2', 10), // consecutive failed checks before declaring DOWN
   historyMax: parseInt(process.env.HISTORY_MAX || '300', 10),
   webhookUrl: process.env.ALERT_WEBHOOK_URL || '',
   throttleMs: parseInt(process.env.ALERT_THROTTLE_MS || '300000', 10),
@@ -77,6 +78,7 @@ let services = [];              // [{ name, host, port, path, status, latencyMs,
 let lastAlert = {};
 let lastPollAt = null;
 let historyDirty = false;
+let failStreaks = {};           // name -> consecutive failed checks (resets on any success)
 
 try {
   if (fs.existsSync(HISTORY_FILE)) {
@@ -290,23 +292,38 @@ async function checkServices() {
       ? await checkHttp(svc.host, svc.port, svc.path, cfg.checkTimeoutMs)
       : await checkTcp(svc.host, svc.port, cfg.checkTimeoutMs);
 
-    let network = null;   // only diagnosed on failure; null = n/a (service is online)
-    let reason = svc.path ? 'http-check-failed' : 'port-unreachable';
+    let network = null;
+    let reason = null;
+    let status;
 
-    if (!result.ok) {
-      const hostReachable = await pingHost(svc.host, 2);
-      if (hostReachable === null) {
-        network = 'unknown';
-        reason = `${reason} (ping unavailable to diagnose — install iputils-ping)`;
+    if (result.ok) {
+      failStreaks[svc.name] = 0;
+      status = 'online';
+    } else {
+      failStreaks[svc.name] = (failStreaks[svc.name] || 0) + 1;
+      const baseReason = svc.path ? 'http-check-failed' : 'port-unreachable';
+
+      if (failStreaks[svc.name] < cfg.failureThreshold) {
+        // Below threshold — likely a blip (slow response, transient network hiccup).
+        // Don't diagnose/alert/record downtime yet, just surface it as "degraded" in the UI.
+        status = 'degraded';
+        reason = `${baseReason} (check ${failStreaks[svc.name]}/${cfg.failureThreshold} — not yet alerting)`;
       } else {
-        network = hostReachable ? 'host-reachable' : 'host-unreachable';
-        reason = hostReachable
-          ? `${reason} (host up — app/port is down)`
-          : 'host-unreachable (network/VPN path down)';
+        status = 'stopped';
+        const hostReachable = await pingHost(svc.host, 2);
+        if (hostReachable === null) {
+          network = 'unknown';
+          reason = `${baseReason} (ping unavailable to diagnose — install iputils-ping)`;
+        } else {
+          network = hostReachable ? 'host-reachable' : 'host-unreachable';
+          reason = hostReachable
+            ? `${baseReason} (host up — app/port is down)`
+            : 'host-unreachable (network/VPN path down)';
+        }
       }
     }
 
-    return { ...svc, ...result, network, reason };
+    return { ...svc, ...result, status, network, reason };
   }));
 
   services = results.map(r => ({
@@ -314,16 +331,19 @@ async function checkServices() {
     host: r.host,
     port: r.port,
     path: r.path,
-    status: r.ok ? 'online' : 'stopped',
+    status: r.status,
     latencyMs: r.latencyMs,
     statusCode: r.statusCode || null,
     network: r.network,
+    failStreak: failStreaks[r.name] || 0,
     lastCheckedAt: Date.now()
   }));
 
   results.forEach(r => {
-    if (r.ok) recordUp(r.name);
-    else recordDown(r.name, r.reason);
+    if (r.status === 'online') recordUp(r.name);
+    else if (r.status === 'stopped') recordDown(r.name, r.reason);
+    // 'degraded' -> intentionally no history/alert yet, just logged for visibility
+    else log(`SOFT-FAIL -> ${r.name} (${r.reason})`);
   });
 
   checkEscalations();
@@ -361,7 +381,9 @@ function tailLog(name, lines = 300) {
 // Dashboard UI
 // ────────────────────────────────────────────────
 function statusDotClass(status) {
-  return status === 'online' ? 'dot-online' : 'dot-offline';
+  if (status === 'online') return 'dot-online';
+  if (status === 'degraded') return 'dot-degraded';
+  return 'dot-offline';
 }
 
 function networkTag(s) {
@@ -374,7 +396,8 @@ function networkTag(s) {
 
 function renderDashboard(tokenQ = '') {
   const onlineCount = services.filter(s => s.status === 'online').length;
-  const offlineCount = services.length - onlineCount;
+  const degradedCount = services.filter(s => s.status === 'degraded').length;
+  const offlineCount = services.filter(s => s.status === 'stopped').length;
   const avgSla = services.length
     ? (services.reduce((s, svc) => s + parseFloat(uptimePercent(svc.name)), 0) / services.length).toFixed(2)
     : '100.00';
@@ -391,6 +414,13 @@ function renderDashboard(tokenQ = '') {
         <div>
           <div class="kpi-value" id="kpiOnline">${onlineCount}<span class="kpi-value-muted">/${services.length}</span></div>
           <div class="kpi-label">Services Online</div>
+        </div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-icon icon-degraded">&#9679;</div>
+        <div>
+          <div class="kpi-value" id="kpiDegraded">${degradedCount}</div>
+          <div class="kpi-label">Checking (unconfirmed)</div>
         </div>
       </div>
       <div class="kpi">
@@ -416,10 +446,13 @@ function renderDashboard(tokenQ = '') {
       </div>
     </div>`;
 
+  const statusRank = { stopped: 0, degraded: 1, online: 2 };
+  const rowClass = status => status === 'online' ? 'online' : status === 'degraded' ? 'degraded' : 'offline';
+
   const rows = [...services]
-    .sort((a, b) => (a.status === 'online' ? 1 : 0) - (b.status === 'online' ? 1 : 0) || a.name.localeCompare(b.name))
+    .sort((a, b) => (statusRank[a.status] ?? 1) - (statusRank[b.status] ?? 1) || a.name.localeCompare(b.name))
     .map(s => {
-      const cls = s.status === 'online' ? 'online' : 'offline';
+      const cls = rowClass(s.status);
       const target = s.path ? `${s.host}:${s.port}${s.path}` : `${s.host}:${s.port}`;
       const ignored = cfg.ignore.has(s.name) ? ' <span class="tag-ignored">ignored</span>' : '';
       return `
@@ -479,6 +512,7 @@ function renderDashboard(tokenQ = '') {
     .kpi { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px 20px; display: flex; align-items: center; gap: 14px; box-shadow: 0 1px 2px rgb(0 0 0 / 0.03); }
     .kpi-icon { width: 38px; height: 38px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 1rem; flex-shrink: 0; }
     .icon-online  { background: #dcfce7; color: var(--green); }
+    .icon-degraded { background: #fef3c7; color: var(--orange); }
     .icon-offline { background: #fee2e2; color: var(--red); }
     .icon-restart { background: #ede9fe; color: var(--accent); }
     .icon-sla     { background: #dbeafe; color: #2563eb; }
@@ -495,12 +529,16 @@ function renderDashboard(tokenQ = '') {
     tbody tr:hover td { background: #f8fafc; }
     tr.offline td { background: #fef2f2; }
     tr.offline:hover td { background: #fde8e8; }
+    tr.degraded td { background: #fffbeb; }
+    tr.degraded:hover td { background: #fef3c7; }
     .mono { font-variant-numeric: tabular-nums; font-family: ui-monospace, 'SF Mono', Menlo, monospace; }
     .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 8px; }
     .dot-online { background: var(--green); }
+    .dot-degraded { background: var(--orange); }
     .dot-offline { background: var(--red); }
     .badge { padding: 3px 10px; border-radius: 999px; font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; }
     .badge.online  { background: #dcfce7; color: #166534; }
+    .badge.degraded { background: #fef3c7; color: #92400e; }
     .badge.offline { background: #fee2e2; color: #991b1b; }
     .tag-ignored { font-size: 0.68rem; color: var(--muted); background: #f1f5f9; padding: 1px 7px; border-radius: 999px; margin-left: 6px; font-weight: 500; }
     .tag-net { font-size: 0.68rem; padding: 2px 8px; border-radius: 999px; margin-left: 6px; font-weight: 600; }
@@ -590,13 +628,24 @@ function renderDashboard(tokenQ = '') {
         : ' <span class="tag-net net-ok">host up, app down</span>';
     }
 
+    function rowClass(status) {
+      if (status === 'online') return 'online';
+      if (status === 'degraded') return 'degraded';
+      return 'offline';
+    }
+    function dotClass(status) {
+      if (status === 'online') return 'dot-online';
+      if (status === 'degraded') return 'dot-degraded';
+      return 'dot-offline';
+    }
+
     function renderSvcRow(s) {
-      var cls = s.status === 'online' ? 'online' : 'offline';
+      var cls = rowClass(s.status);
       var target = s.path ? (s.host + ':' + s.port + s.path) : (s.host + ':' + s.port);
       var ignoredTag = s.ignored ? ' <span class="tag-ignored">ignored</span>' : '';
       var lastChecked = s.lastCheckedAt ? new Date(s.lastCheckedAt).toLocaleTimeString() : '-';
       return '<tr class="' + cls + '" data-name="' + escapeHtml(s.name.toLowerCase()) + '">' +
-        '<td><span class="dot ' + (s.status === 'online' ? 'dot-online' : 'dot-offline') + '"></span><strong>' + escapeHtml(s.name) + '</strong>' + ignoredTag + '</td>' +
+        '<td><span class="dot ' + dotClass(s.status) + '"></span><strong>' + escapeHtml(s.name) + '</strong>' + ignoredTag + '</td>' +
         '<td class="mono">' + escapeHtml(target) + '</td>' +
         '<td>' + (s.path ? 'HTTP' : 'TCP') + '</td>' +
         '<td><span class="badge ' + cls + '">' + escapeHtml(s.status) + '</span>' + networkTag(s) + '</td>' +
@@ -635,18 +684,23 @@ function renderDashboard(tokenQ = '') {
 
         var total = data.services.length;
         var onlineCount = data.services.filter(function (s) { return s.status === 'online'; }).length;
-        var offlineCount = total - onlineCount;
+        var degradedCount = data.services.filter(function (s) { return s.status === 'degraded'; }).length;
+        var offlineCount = data.services.filter(function (s) { return s.status === 'stopped'; }).length;
         var avgSla = total ? (data.services.reduce(function (sum, s) { return sum + parseFloat(s.slaPercent); }, 0) / total).toFixed(2) : '100.00';
         var avgLatency = total ? Math.round(data.services.reduce(function (sum, s) { return sum + (s.latencyMs || 0); }, 0) / total) : 0;
 
         document.getElementById('kpiOnline').innerHTML = onlineCount + '<span class="kpi-value-muted">/' + total + '</span>';
+        document.getElementById('kpiDegraded').textContent = degradedCount;
         document.getElementById('kpiOffline').textContent = offlineCount;
         document.getElementById('kpiSla').innerHTML = avgSla + '<span class="kpi-value-muted">%</span>';
         document.getElementById('kpiLatency').innerHTML = avgLatency + '<span class="kpi-value-muted">ms</span>';
 
         if (data.services.length) {
+          var statusRank = { stopped: 0, degraded: 1, online: 2 };
           var sorted = data.services.slice().sort(function (a, b) {
-            return (a.status === 'online' ? 1 : 0) - (b.status === 'online' ? 1 : 0) || a.name.localeCompare(b.name);
+            var ra = statusRank.hasOwnProperty(a.status) ? statusRank[a.status] : 1;
+            var rb = statusRank.hasOwnProperty(b.status) ? statusRank[b.status] : 1;
+            return ra - rb || a.name.localeCompare(b.name);
           });
           document.getElementById('svcTableBody').innerHTML = sorted.map(renderSvcRow).join('');
           applyFilter();
@@ -727,13 +781,13 @@ const server = http.createServer((req, res) => {
     const stale = lastPollAt && (Date.now() - lastPollAt) > cfg.checkIntervalMs * 3;
     const hasPolled = cfg.services.length === 0 || lastPollAt !== null;
     const allOnline = hasPolled && !stale &&
-      services.every(s => s.status === 'online' || cfg.ignore.has(s.name));
+      services.every(s => s.status !== 'stopped' || cfg.ignore.has(s.name));
     const body = {
       status: allOnline ? 'ok' : 'degraded',
       configured: cfg.services.length,
       polled: hasPolled,
       stale: !!stale,
-      downServices: services.filter(s => s.status !== 'online' && !cfg.ignore.has(s.name)).map(s => s.name)
+      downServices: services.filter(s => s.status === 'stopped' && !cfg.ignore.has(s.name)).map(s => s.name)
     };
     return send(res, allOnline ? 200 : 503, JSON.stringify(body, null, 2), 'application/json');
   }
