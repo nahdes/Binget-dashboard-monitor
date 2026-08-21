@@ -90,6 +90,8 @@ let lastAlert = {};
 let lastPollAt = null;
 let historyDirty = false;
 let failStreaks = {};           // name -> consecutive failed checks (resets on any success)
+let latencyHistory = {};        // name -> [latencyMs, ...] capped rolling window, powers the card sparkline
+const LATENCY_HISTORY_LEN = 20;
 
 try {
   if (fs.existsSync(HISTORY_FILE)) {
@@ -352,6 +354,14 @@ async function checkServices() {
     lastCheckedAt: Date.now()
   }));
 
+  services.forEach(s => {
+    if (s.latencyMs != null) {
+      const buf = latencyHistory[s.name] || (latencyHistory[s.name] = []);
+      buf.push(s.latencyMs);
+      if (buf.length > LATENCY_HISTORY_LEN) buf.shift();
+    }
+  });
+
   results.forEach(r => {
     if (r.status === 'online') recordUp(r.name);
     else if (r.status === 'stopped') recordDown(r.name, r.reason);
@@ -399,6 +409,18 @@ function statusDotClass(status) {
   return 'dot-offline';
 }
 
+function statusRankOf(status) {
+  return { stopped: 0, degraded: 1, online: 2 }[status] ?? 1;
+}
+
+function rowClassOf(status) {
+  return status === 'online' ? 'online' : status === 'degraded' ? 'degraded' : 'offline';
+}
+
+function sanitizeGroupId(group) {
+  return 'grp-' + String(group).toLowerCase().replace(/[^a-z0-9]+/g, '-');
+}
+
 function networkTag(s) {
   if (s.status === 'online' || !s.network) return '';
   if (s.network === 'unknown') return ` <span class="tag-net net-unknown" title="Ping unavailable to diagnose">?</span>`;
@@ -406,6 +428,79 @@ function networkTag(s) {
     ? ` <span class="tag-net net-bad" title="Network/VPN path down">&#9888;</span>`
     : ` <span class="tag-net net-ok" title="Host reachable — app/port is down">&#9679;</span>`;
 }
+
+// Small inline SVG line chart — no external chart library, just hand-rolled markup.
+function sparklineSvg(values, color) {
+  const width = 100, height = 32;
+  if (!values || values.length < 2) {
+    return `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"></svg>`;
+  }
+  const max = Math.max(...values);
+  const min = Math.min(...values);
+  const range = (max - min) || 1;
+  const stepX = width / (values.length - 1);
+  const pts = values.map((v, i) => {
+    const x = i * stepX;
+    const y = height - 4 - ((v - min) / range) * (height - 8);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+  const [lastX, lastY] = pts[pts.length - 1].split(',');
+  return `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
+    <polyline points="${pts.join(' ')}" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="${lastX}" cy="${lastY}" r="3" fill="${color}"/>
+  </svg>`;
+}
+
+function statusColorVar(status) {
+  if (status === 'online') return 'var(--green)';
+  if (status === 'degraded') return 'var(--orange)';
+  return 'var(--red)';
+}
+
+function cardDeltaHtml(name) {
+  const hist = latencyHistory[name] || [];
+  if (hist.length < 2) return '';
+  const cur = hist[hist.length - 1];
+  const prev = hist[hist.length - 2];
+  const diff = cur - prev;
+  if (diff === 0) return `<div class="card-delta delta-flat">&#8212; steady vs prior check</div>`;
+  const improved = diff < 0; // lower latency = better
+  const pct = prev ? Math.round((Math.abs(diff) / prev) * 100) : 0;
+  const arrow = improved ? '&#9660;' : '&#9650;';
+  const cls = improved ? 'delta-good' : 'delta-bad';
+  return `<div class="card-delta ${cls}">${arrow} ${Math.abs(diff)}ms (${pct}%) vs prior check</div>`;
+}
+
+function cardDescription(s) {
+  if (s.status !== 'online' && s.network) {
+    if (s.network === 'host-unreachable') return 'Network/VPN path down';
+    if (s.network === 'unknown') return 'Ping unavailable to diagnose';
+    return 'Host reachable — app/port is down';
+  }
+  const checked = s.lastCheckedAt ? new Date(s.lastCheckedAt).toLocaleTimeString() : '-';
+  return `SLA 7d ${uptimePercent(s.name)}% · checked ${checked}`;
+}
+
+function renderMetricCardServer(s, tokenQ) {
+  const cls = rowClassOf(s.status);
+  const ignored = cfg.ignore.has(s.name) ? ' <span class="tag-ignored">ignored</span>' : '';
+  const spark = sparklineSvg(latencyHistory[s.name], s.status === 'online' ? '#3b82f6' : '#dc2626');
+  return `
+    <div class="metric-card ${cls}" data-name="${escapeHtml(s.name.toLowerCase())}">
+      <div class="metric-card-top">
+        <span class="metric-card-label">${s.path ? 'HTTP' : 'TCP'} check${networkTag(s)}</span>
+        <a class="metric-card-menu" href="/logs/${encodeURIComponent(s.name)}${tokenQ}" title="View logs">&#8942;</a>
+      </div>
+      <div class="metric-card-title">${escapeHtml(s.name)}${ignored}</div>
+      <div class="metric-card-value" style="color:${statusColorVar(s.status)}">
+        <span class="dot ${statusDotClass(s.status)}"></span>${escapeHtml(s.status.toUpperCase())}
+      </div>
+      ${cardDeltaHtml(s.name)}
+      <div class="metric-card-chart">${spark}</div>
+      <div class="metric-card-desc">${escapeHtml(cardDescription(s))}</div>
+    </div>`;
+}
+
 
 function renderDashboard(tokenQ = '') {
   const onlineCount = services.filter(s => s.status === 'online').length;
@@ -459,36 +554,6 @@ function renderDashboard(tokenQ = '') {
       </div>
     </div>`;
 
-function statusRankOf(status) {
-  return { stopped: 0, degraded: 1, online: 2 }[status] ?? 1;
-}
-
-function rowClassOf(status) {
-  return status === 'online' ? 'online' : status === 'degraded' ? 'degraded' : 'offline';
-}
-
-function sanitizeGroupId(group) {
-  return 'grp-' + String(group).toLowerCase().replace(/[^a-z0-9]+/g, '-');
-}
-
-function renderSvcRowServer(s, tokenQ) {
-  const cls = rowClassOf(s.status);
-  const ignored = cfg.ignore.has(s.name) ? ' <span class="tag-ignored">ignored</span>' : '';
-  const checkTag = `<span class="tag-check">${s.path ? 'HTTP' : 'TCP'}</span>`;
-  const latencyCell = s.latencyMs != null
-    ? `${s.latencyMs} ms${s.statusCode ? ` <span class="sub-code">${s.statusCode}</span>` : ''}`
-    : '-';
-  return `
-    <tr class="${cls}" data-name="${escapeHtml(s.name.toLowerCase())}">
-      <td><span class="dot ${statusDotClass(s.status)}"></span><strong>${escapeHtml(s.name)}</strong> ${checkTag}${ignored}</td>
-      <td><span class="badge ${cls}">${escapeHtml(s.status)}</span>${networkTag(s)}</td>
-      <td class="mono">${latencyCell}</td>
-      <td class="mono">${uptimePercent(s.name)}%</td>
-      <td class="mono">${s.lastCheckedAt ? new Date(s.lastCheckedAt).toLocaleTimeString() : '-'}</td>
-      <td><a class="btn" href="/logs/${encodeURIComponent(s.name)}${tokenQ}">Logs</a></td>
-    </tr>`;
-}
-
   const GROUP_ORDER = ['Production', 'UAT', 'Infrastructure'];
   const presentGroups = Array.from(new Set(services.map(s => s.group)));
   const orderedGroups = [
@@ -501,22 +566,11 @@ function renderSvcRowServer(s, tokenQ) {
       .filter(s => s.group === group)
       .sort((a, b) => statusRankOf(a.status) - statusRankOf(b.status) || a.name.localeCompare(b.name));
     const gid = sanitizeGroupId(group);
-    const groupRows = groupServices.map(s => renderSvcRowServer(s, tokenQ)).join('');
+    const groupCards = groupServices.map(s => renderMetricCardServer(s, tokenQ)).join('');
     return `
-    <div class="group-col">
-      <div class="section-title">${escapeHtml(group)} <span class="sub">${groupServices.length} service${groupServices.length === 1 ? '' : 's'}</span></div>
-      <div class="card">
-        <div class="table-scroll">
-        <table class="svc-table" data-group="${gid}">
-          <thead>
-            <tr><th>Name</th><th>Status</th><th>Latency</th><th>SLA</th><th>Checked</th><th></th></tr>
-          </thead>
-          <tbody id="svcBody-${gid}">
-            ${groupRows || '<tr><td colspan="6" class="empty">No services in this group</td></tr>'}
-          </tbody>
-        </table>
-        </div>
-      </div>
+    <div class="section-title">${escapeHtml(group)} <span class="sub">${groupServices.length} service${groupServices.length === 1 ? '' : 's'}</span></div>
+    <div class="metric-grid" data-group="${gid}" id="cardsGrid-${gid}">
+      ${groupCards || '<div class="card"><div class="empty">No services in this group</div></div>'}
     </div>`;
   }).join('');
 
@@ -573,39 +627,52 @@ function renderSvcRowServer(s, tokenQ) {
     .card { background: var(--card); border-radius: var(--radius); border: 1px solid var(--border); box-shadow: 0 1px 2px rgb(0 0 0 / 0.03); overflow: hidden; }
     .section-title { font-size: 1rem; font-weight: 700; margin: 30px 0 12px; display: flex; align-items: center; gap: 10px; }
     .section-title .sub { font-weight: 400; font-size: 0.78rem; color: var(--muted); }
-    .groups-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 18px; align-items: start; }
-    .group-col .section-title { margin-top: 0; }
     .filter-input { margin-left: auto; border: 1px solid var(--border); background: var(--card); padding: 7px 12px; border-radius: 8px; font-size: 0.82rem; width: 220px; }
     .filter-input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { padding: 11px 16px; text-align: left; border-bottom: 1px solid var(--border); font-size: 0.83rem; }
-    th { background: #f8fafc; color: var(--muted); font-weight: 600; text-transform: uppercase; font-size: 0.68rem; letter-spacing: 0.05em; }
-    tbody tr:hover td { background: #f8fafc; }
-    tr.offline td { background: #fef2f2; }
-    tr.offline:hover td { background: #fde8e8; }
-    tr.degraded td { background: #fffbeb; }
-    tr.degraded:hover td { background: #fef3c7; }
+
+    .metric-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 16px; margin-bottom: 8px; }
+    .metric-card {
+      background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+      padding: 16px 18px; box-shadow: 0 1px 2px rgb(0 0 0 / 0.04);
+      transition: box-shadow 0.15s ease, transform 0.15s ease;
+    }
+    .metric-card:hover { box-shadow: 0 6px 16px rgb(0 0 0 / 0.08); transform: translateY(-1px); }
+    .metric-card.offline { background: #fffbfb; border-color: #fecaca; }
+    .metric-card.degraded { background: #fffdf7; border-color: #fde68a; }
+    .metric-card-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+    .metric-card-label { font-size: 0.68rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
+    .metric-card-menu { color: var(--muted); text-decoration: none; font-size: 1rem; padding: 0 4px; border-radius: 4px; }
+    .metric-card-menu:hover { background: #f1f5f9; color: var(--text); }
+    .metric-card-title { font-size: 0.92rem; font-weight: 700; color: var(--text); margin-bottom: 6px; line-height: 1.25; }
+    .metric-card-value { font-size: 1.35rem; font-weight: 800; letter-spacing: -0.01em; display: flex; align-items: center; margin-bottom: 4px; }
+    .metric-card-value .dot { width: 8px; height: 8px; margin-right: 8px; }
+    .card-delta { font-size: 0.76rem; font-weight: 600; margin-bottom: 10px; }
+    .card-delta.delta-good { color: var(--green); }
+    .card-delta.delta-bad { color: var(--red); }
+    .card-delta.delta-flat { color: var(--muted); font-weight: 500; }
+    .metric-card-chart { line-height: 0; margin-bottom: 10px; }
+    .metric-card-chart svg { width: 100%; height: 32px; }
+    .metric-card-desc { font-size: 0.76rem; color: var(--muted); line-height: 1.4; }
+
     .mono { font-variant-numeric: tabular-nums; font-family: ui-monospace, 'SF Mono', Menlo, monospace; }
     .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 8px; }
     .dot-online { background: var(--green); }
     .dot-degraded { background: var(--orange); }
     .dot-offline { background: var(--red); }
-    .badge { padding: 3px 10px; border-radius: 999px; font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; }
-    .badge.online  { background: #dcfce7; color: #166534; }
-    .badge.degraded { background: #fef3c7; color: #92400e; }
-    .badge.offline { background: #fee2e2; color: #991b1b; }
-    .tag-ignored { font-size: 0.68rem; color: var(--muted); background: #f1f5f9; padding: 1px 7px; border-radius: 999px; margin-left: 6px; font-weight: 500; }
-    .tag-check { font-size: 0.62rem; color: var(--muted); background: #f1f5f9; padding: 1px 6px; border-radius: 5px; margin-left: 4px; font-weight: 600; letter-spacing: 0.02em; vertical-align: 1px; }
+    .tag-ignored { font-size: 0.62rem; color: var(--muted); background: #f1f5f9; padding: 1px 7px; border-radius: 999px; margin-left: 6px; font-weight: 500; }
     .tag-net {
       display: inline-flex; align-items: center; justify-content: center;
-      width: 16px; height: 16px; border-radius: 50%; margin-left: 6px;
-      font-size: 0.62rem; font-weight: 700; cursor: help; vertical-align: -3px;
+      width: 14px; height: 14px; border-radius: 50%; margin-left: 6px;
+      font-size: 0.58rem; font-weight: 700; cursor: help;
     }
     .tag-net.net-bad { background: #fee2e2; color: #991b1b; }
     .tag-net.net-ok  { background: #ffedd5; color: #9a3412; }
     .tag-net.net-unknown { background: #e5e7eb; color: #374151; }
-    .sub-code { color: var(--muted); font-size: 0.75rem; }
-    .table-scroll { overflow-x: auto; }
+
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 11px 16px; text-align: left; border-bottom: 1px solid var(--border); font-size: 0.83rem; }
+    th { background: #f8fafc; color: var(--muted); font-weight: 600; text-transform: uppercase; font-size: 0.68rem; letter-spacing: 0.05em; }
+    tbody tr:hover td { background: #f8fafc; }
     .still-down { color: var(--red); font-style: italic; }
     .btn { display: inline-block; padding: 5px 13px; background: var(--accent); color: white; border-radius: 7px; text-decoration: none; font-size: 0.78rem; font-weight: 600; }
     .btn:hover { filter: brightness(1.08); }
@@ -634,9 +701,7 @@ function renderSvcRowServer(s, tokenQ) {
       Services by Environment
       <input class="filter-input" id="filterInput" type="text" placeholder="Filter by name...">
     </div>
-    <div class="groups-row">
-      ${groupSectionsHtml || '<div class="card"><div class="empty">No services configured</div></div>'}
-    </div>
+    ${groupSectionsHtml || '<div class="card"><div class="empty">No services configured</div></div>'}
 
     <div class="section-title">Recent Downtime</div>
     <div class="card">
@@ -693,23 +758,73 @@ function renderSvcRowServer(s, tokenQ) {
       if (status === 'degraded') return 'dot-degraded';
       return 'dot-offline';
     }
+    function statusColorVar(status) {
+      if (status === 'online') return 'var(--green)';
+      if (status === 'degraded') return 'var(--orange)';
+      return 'var(--red)';
+    }
 
-    function renderSvcRow(s) {
+    function sparklineSvg(values, color) {
+      var width = 100, height = 32;
+      if (!values || values.length < 2) {
+        return '<svg width="' + width + '" height="' + height + '" viewBox="0 0 ' + width + ' ' + height + '"></svg>';
+      }
+      var max = Math.max.apply(null, values);
+      var min = Math.min.apply(null, values);
+      var range = (max - min) || 1;
+      var stepX = width / (values.length - 1);
+      var pts = values.map(function (v, i) {
+        var x = i * stepX;
+        var y = height - 4 - ((v - min) / range) * (height - 8);
+        return x.toFixed(1) + ',' + y.toFixed(1);
+      });
+      var last = pts[pts.length - 1].split(',');
+      return '<svg width="' + width + '" height="' + height + '" viewBox="0 0 ' + width + ' ' + height + '" preserveAspectRatio="none">' +
+        '<polyline points="' + pts.join(' ') + '" fill="none" stroke="' + color + '" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>' +
+        '<circle cx="' + last[0] + '" cy="' + last[1] + '" r="3" fill="' + color + '"/></svg>';
+    }
+
+    function cardDeltaHtml(hist) {
+      if (!hist || hist.length < 2) return '';
+      var cur = hist[hist.length - 1];
+      var prev = hist[hist.length - 2];
+      var diff = cur - prev;
+      if (diff === 0) return '<div class="card-delta delta-flat">&#8212; steady vs prior check</div>';
+      var improved = diff < 0;
+      var pct = prev ? Math.round((Math.abs(diff) / prev) * 100) : 0;
+      var arrow = improved ? '&#9660;' : '&#9650;';
+      var cls = improved ? 'delta-good' : 'delta-bad';
+      return '<div class="card-delta ' + cls + '">' + arrow + ' ' + Math.abs(diff) + 'ms (' + pct + '%) vs prior check</div>';
+    }
+
+    function cardDescription(s) {
+      if (s.status !== 'online' && s.network) {
+        if (s.network === 'host-unreachable') return 'Network/VPN path down';
+        if (s.network === 'unknown') return 'Ping unavailable to diagnose';
+        return 'Host reachable — app/port is down';
+      }
+      var checked = s.lastCheckedAt ? new Date(s.lastCheckedAt).toLocaleTimeString() : '-';
+      return 'SLA 7d ' + s.slaPercent + '% · checked ' + checked;
+    }
+
+    function renderMetricCard(s) {
       var cls = rowClass(s.status);
       var ignoredTag = s.ignored ? ' <span class="tag-ignored">ignored</span>' : '';
-      var checkTag = '<span class="tag-check">' + (s.path ? 'HTTP' : 'TCP') + '</span>';
-      var lastChecked = s.lastCheckedAt ? new Date(s.lastCheckedAt).toLocaleTimeString() : '-';
-      var latencyCell = s.latencyMs != null
-        ? (s.latencyMs + ' ms' + (s.statusCode ? ' <span class="sub-code">' + s.statusCode + '</span>' : ''))
-        : '-';
-      return '<tr class="' + cls + '" data-name="' + escapeHtml(s.name.toLowerCase()) + '">' +
-        '<td><span class="dot ' + dotClass(s.status) + '"></span><strong>' + escapeHtml(s.name) + '</strong> ' + checkTag + ignoredTag + '</td>' +
-        '<td><span class="badge ' + cls + '">' + escapeHtml(s.status) + '</span>' + networkTag(s) + '</td>' +
-        '<td class="mono">' + latencyCell + '</td>' +
-        '<td class="mono">' + s.slaPercent + '%</td>' +
-        '<td class="mono">' + lastChecked + '</td>' +
-        '<td><a class="btn" href="/logs/' + encodeURIComponent(s.name) + TOKEN_QS + '">Logs</a></td>' +
-      '</tr>';
+      var hist = s.latencySamples || [];
+      var spark = sparklineSvg(hist, s.status === 'online' ? '#3b82f6' : '#dc2626');
+      return '<div class="metric-card ' + cls + '" data-name="' + escapeHtml(s.name.toLowerCase()) + '">' +
+        '<div class="metric-card-top">' +
+          '<span class="metric-card-label">' + (s.path ? 'HTTP' : 'TCP') + ' check' + networkTag(s) + '</span>' +
+          '<a class="metric-card-menu" href="/logs/' + encodeURIComponent(s.name) + TOKEN_QS + '" title="View logs">&#8942;</a>' +
+        '</div>' +
+        '<div class="metric-card-title">' + escapeHtml(s.name) + ignoredTag + '</div>' +
+        '<div class="metric-card-value" style="color:' + statusColorVar(s.status) + '">' +
+          '<span class="dot ' + dotClass(s.status) + '"></span>' + escapeHtml(s.status.toUpperCase()) +
+        '</div>' +
+        cardDeltaHtml(hist) +
+        '<div class="metric-card-chart">' + spark + '</div>' +
+        '<div class="metric-card-desc">' + escapeHtml(cardDescription(s)) + '</div>' +
+      '</div>';
     }
 
     function renderHistRow(h) {
@@ -729,9 +844,9 @@ function renderSvcRowServer(s, tokenQ) {
 
     function applyFilter() {
       var q = (document.getElementById('filterInput').value || '').toLowerCase();
-      document.querySelectorAll('.svc-table tbody tr').forEach(function (row) {
-        var name = row.dataset.name || '';
-        row.style.display = name.indexOf(q) !== -1 ? '' : 'none';
+      document.querySelectorAll('.metric-card').forEach(function (card) {
+        var name = card.dataset.name || '';
+        card.style.display = name.indexOf(q) !== -1 ? '' : 'none';
       });
     }
 
@@ -762,14 +877,14 @@ function renderSvcRowServer(s, tokenQ) {
             (byGroup[g] = byGroup[g] || []).push(s);
           });
           Object.keys(byGroup).forEach(function (g) {
-            var tbody = document.getElementById('svcBody-' + sanitizeGroupId(g));
-            if (!tbody) return; // group didn't exist at initial render (SERVICES changed without restart) — skip rather than break
+            var grid = document.getElementById('cardsGrid-' + sanitizeGroupId(g));
+            if (!grid) return; // group didn't exist at initial render (SERVICES changed without restart) — skip rather than break
             var sorted = byGroup[g].slice().sort(function (a, b) {
               var ra = statusRank.hasOwnProperty(a.status) ? statusRank[a.status] : 1;
               var rb = statusRank.hasOwnProperty(b.status) ? statusRank[b.status] : 1;
               return ra - rb || a.name.localeCompare(b.name);
             });
-            tbody.innerHTML = sorted.map(renderSvcRow).join('');
+            grid.innerHTML = sorted.map(renderMetricCard).join('');
           });
           applyFilter();
         }
@@ -840,7 +955,12 @@ const server = http.createServer((req, res) => {
     return send(res, 200, JSON.stringify({
       services: services.map(s => {
         const { host, port, ...safe } = s; // don't expose internal targets over the wire
-        return { ...safe, slaPercent: uptimePercent(s.name), ignored: cfg.ignore.has(s.name) };
+        return {
+          ...safe,
+          slaPercent: uptimePercent(s.name),
+          ignored: cfg.ignore.has(s.name),
+          latencySamples: latencyHistory[s.name] || []
+        };
       }),
       history: history.slice(0, 30),
       lastPollAt,
