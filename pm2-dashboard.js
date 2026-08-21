@@ -401,10 +401,10 @@ function statusDotClass(status) {
 
 function networkTag(s) {
   if (s.status === 'online' || !s.network) return '';
-  if (s.network === 'unknown') return ' <span class="tag-net net-unknown">ping n/a</span>';
+  if (s.network === 'unknown') return ` <span class="tag-net net-unknown" title="Ping unavailable to diagnose">?</span>`;
   return s.network === 'host-unreachable'
-    ? ' <span class="tag-net net-bad">network/VPN down</span>'
-    : ' <span class="tag-net net-ok">host up, app down</span>';
+    ? ` <span class="tag-net net-bad" title="Network/VPN path down">&#9888;</span>`
+    : ` <span class="tag-net net-ok" title="Host reachable — app/port is down">&#9679;</span>`;
 }
 
 function renderDashboard(tokenQ = '') {
@@ -474,13 +474,15 @@ function sanitizeGroupId(group) {
 function renderSvcRowServer(s, tokenQ) {
   const cls = rowClassOf(s.status);
   const ignored = cfg.ignore.has(s.name) ? ' <span class="tag-ignored">ignored</span>' : '';
+  const checkTag = `<span class="tag-check">${s.path ? 'HTTP' : 'TCP'}</span>`;
+  const latencyCell = s.latencyMs != null
+    ? `${s.latencyMs} ms${s.statusCode ? ` <span class="sub-code">${s.statusCode}</span>` : ''}`
+    : '-';
   return `
     <tr class="${cls}" data-name="${escapeHtml(s.name.toLowerCase())}">
-      <td><span class="dot ${statusDotClass(s.status)}"></span><strong>${escapeHtml(s.name)}</strong>${ignored}</td>
-      <td>${s.path ? 'HTTP' : 'TCP'}</td>
+      <td><span class="dot ${statusDotClass(s.status)}"></span><strong>${escapeHtml(s.name)}</strong> ${checkTag}${ignored}</td>
       <td><span class="badge ${cls}">${escapeHtml(s.status)}</span>${networkTag(s)}</td>
-      <td class="mono">${s.statusCode || '-'}</td>
-      <td class="mono">${s.latencyMs != null ? s.latencyMs + ' ms' : '-'}</td>
+      <td class="mono">${latencyCell}</td>
       <td class="mono">${uptimePercent(s.name)}%</td>
       <td class="mono">${s.lastCheckedAt ? new Date(s.lastCheckedAt).toLocaleTimeString() : '-'}</td>
       <td><a class="btn" href="/logs/${encodeURIComponent(s.name)}${tokenQ}">Logs</a></td>
@@ -504,14 +506,16 @@ function renderSvcRowServer(s, tokenQ) {
     <div class="group-col">
       <div class="section-title">${escapeHtml(group)} <span class="sub">${groupServices.length} service${groupServices.length === 1 ? '' : 's'}</span></div>
       <div class="card">
+        <div class="table-scroll">
         <table class="svc-table" data-group="${gid}">
           <thead>
-            <tr><th>Name</th><th>Check</th><th>Status</th><th>HTTP</th><th>Latency</th><th>7d SLA</th><th>Last Checked</th><th></th></tr>
+            <tr><th>Name</th><th>Status</th><th>Latency</th><th>SLA</th><th>Checked</th><th></th></tr>
           </thead>
           <tbody id="svcBody-${gid}">
-            ${groupRows || '<tr><td colspan="8" class="empty">No services in this group</td></tr>'}
+            ${groupRows || '<tr><td colspan="6" class="empty">No services in this group</td></tr>'}
           </tbody>
         </table>
+        </div>
       </div>
     </div>`;
   }).join('');
@@ -591,10 +595,17 @@ function renderSvcRowServer(s, tokenQ) {
     .badge.degraded { background: #fef3c7; color: #92400e; }
     .badge.offline { background: #fee2e2; color: #991b1b; }
     .tag-ignored { font-size: 0.68rem; color: var(--muted); background: #f1f5f9; padding: 1px 7px; border-radius: 999px; margin-left: 6px; font-weight: 500; }
-    .tag-net { font-size: 0.68rem; padding: 2px 8px; border-radius: 999px; margin-left: 6px; font-weight: 600; }
+    .tag-check { font-size: 0.62rem; color: var(--muted); background: #f1f5f9; padding: 1px 6px; border-radius: 5px; margin-left: 4px; font-weight: 600; letter-spacing: 0.02em; vertical-align: 1px; }
+    .tag-net {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 16px; height: 16px; border-radius: 50%; margin-left: 6px;
+      font-size: 0.62rem; font-weight: 700; cursor: help; vertical-align: -3px;
+    }
     .tag-net.net-bad { background: #fee2e2; color: #991b1b; }
     .tag-net.net-ok  { background: #ffedd5; color: #9a3412; }
     .tag-net.net-unknown { background: #e5e7eb; color: #374151; }
+    .sub-code { color: var(--muted); font-size: 0.75rem; }
+    .table-scroll { overflow-x: auto; }
     .still-down { color: var(--red); font-style: italic; }
     .btn { display: inline-block; padding: 5px 13px; background: var(--accent); color: white; border-radius: 7px; text-decoration: none; font-size: 0.78rem; font-weight: 600; }
     .btn:hover { filter: brightness(1.08); }
@@ -666,10 +677,10 @@ function renderSvcRowServer(s, tokenQ) {
 
     function networkTag(s) {
       if (s.status === 'online' || !s.network) return '';
-      if (s.network === 'unknown') return ' <span class="tag-net net-unknown">ping n/a</span>';
+      if (s.network === 'unknown') return ' <span class="tag-net net-unknown" title="Ping unavailable to diagnose">?</span>';
       return s.network === 'host-unreachable'
-        ? ' <span class="tag-net net-bad">network/VPN down</span>'
-        : ' <span class="tag-net net-ok">host up, app down</span>';
+        ? ' <span class="tag-net net-bad" title="Network/VPN path down">&#9888;</span>'
+        : ' <span class="tag-net net-ok" title="Host reachable — app/port is down">&#9679;</span>';
     }
 
     function rowClass(status) {
@@ -686,13 +697,15 @@ function renderSvcRowServer(s, tokenQ) {
     function renderSvcRow(s) {
       var cls = rowClass(s.status);
       var ignoredTag = s.ignored ? ' <span class="tag-ignored">ignored</span>' : '';
+      var checkTag = '<span class="tag-check">' + (s.path ? 'HTTP' : 'TCP') + '</span>';
       var lastChecked = s.lastCheckedAt ? new Date(s.lastCheckedAt).toLocaleTimeString() : '-';
+      var latencyCell = s.latencyMs != null
+        ? (s.latencyMs + ' ms' + (s.statusCode ? ' <span class="sub-code">' + s.statusCode + '</span>' : ''))
+        : '-';
       return '<tr class="' + cls + '" data-name="' + escapeHtml(s.name.toLowerCase()) + '">' +
-        '<td><span class="dot ' + dotClass(s.status) + '"></span><strong>' + escapeHtml(s.name) + '</strong>' + ignoredTag + '</td>' +
-        '<td>' + (s.path ? 'HTTP' : 'TCP') + '</td>' +
+        '<td><span class="dot ' + dotClass(s.status) + '"></span><strong>' + escapeHtml(s.name) + '</strong> ' + checkTag + ignoredTag + '</td>' +
         '<td><span class="badge ' + cls + '">' + escapeHtml(s.status) + '</span>' + networkTag(s) + '</td>' +
-        '<td class="mono">' + (s.statusCode || '-') + '</td>' +
-        '<td class="mono">' + (s.latencyMs != null ? s.latencyMs + ' ms' : '-') + '</td>' +
+        '<td class="mono">' + latencyCell + '</td>' +
         '<td class="mono">' + s.slaPercent + '%</td>' +
         '<td class="mono">' + lastChecked + '</td>' +
         '<td><a class="btn" href="/logs/' + encodeURIComponent(s.name) + TOKEN_QS + '">Logs</a></td>' +
