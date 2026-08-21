@@ -473,12 +473,10 @@ function sanitizeGroupId(group) {
 
 function renderSvcRowServer(s, tokenQ) {
   const cls = rowClassOf(s.status);
-  const target = s.path ? `${s.host}:${s.port}${s.path}` : `${s.host}:${s.port}`;
   const ignored = cfg.ignore.has(s.name) ? ' <span class="tag-ignored">ignored</span>' : '';
   return `
     <tr class="${cls}" data-name="${escapeHtml(s.name.toLowerCase())}">
       <td><span class="dot ${statusDotClass(s.status)}"></span><strong>${escapeHtml(s.name)}</strong>${ignored}</td>
-      <td class="mono">${escapeHtml(target)}</td>
       <td>${s.path ? 'HTTP' : 'TCP'}</td>
       <td><span class="badge ${cls}">${escapeHtml(s.status)}</span>${networkTag(s)}</td>
       <td class="mono">${s.statusCode || '-'}</td>
@@ -503,16 +501,18 @@ function renderSvcRowServer(s, tokenQ) {
     const gid = sanitizeGroupId(group);
     const groupRows = groupServices.map(s => renderSvcRowServer(s, tokenQ)).join('');
     return `
-    <div class="section-title">${escapeHtml(group)} <span class="sub">${groupServices.length} service${groupServices.length === 1 ? '' : 's'}</span></div>
-    <div class="card">
-      <table class="svc-table" data-group="${gid}">
-        <thead>
-          <tr><th>Name</th><th>Target</th><th>Check</th><th>Status</th><th>HTTP</th><th>Latency</th><th>7d SLA</th><th>Last Checked</th><th></th></tr>
-        </thead>
-        <tbody id="svcBody-${gid}">
-          ${groupRows || '<tr><td colspan="9" class="empty">No services in this group</td></tr>'}
-        </tbody>
-      </table>
+    <div class="group-col">
+      <div class="section-title">${escapeHtml(group)} <span class="sub">${groupServices.length} service${groupServices.length === 1 ? '' : 's'}</span></div>
+      <div class="card">
+        <table class="svc-table" data-group="${gid}">
+          <thead>
+            <tr><th>Name</th><th>Check</th><th>Status</th><th>HTTP</th><th>Latency</th><th>7d SLA</th><th>Last Checked</th><th></th></tr>
+          </thead>
+          <tbody id="svcBody-${gid}">
+            ${groupRows || '<tr><td colspan="8" class="empty">No services in this group</td></tr>'}
+          </tbody>
+        </table>
+      </div>
     </div>`;
   }).join('');
 
@@ -569,6 +569,8 @@ function renderSvcRowServer(s, tokenQ) {
     .card { background: var(--card); border-radius: var(--radius); border: 1px solid var(--border); box-shadow: 0 1px 2px rgb(0 0 0 / 0.03); overflow: hidden; }
     .section-title { font-size: 1rem; font-weight: 700; margin: 30px 0 12px; display: flex; align-items: center; gap: 10px; }
     .section-title .sub { font-weight: 400; font-size: 0.78rem; color: var(--muted); }
+    .groups-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 18px; align-items: start; }
+    .group-col .section-title { margin-top: 0; }
     .filter-input { margin-left: auto; border: 1px solid var(--border); background: var(--card); padding: 7px 12px; border-radius: 8px; font-size: 0.82rem; width: 220px; }
     .filter-input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
     table { width: 100%; border-collapse: collapse; }
@@ -621,7 +623,9 @@ function renderSvcRowServer(s, tokenQ) {
       Services by Environment
       <input class="filter-input" id="filterInput" type="text" placeholder="Filter by name...">
     </div>
-    ${groupSectionsHtml || '<div class="card"><div class="empty">No services configured</div></div>'}
+    <div class="groups-row">
+      ${groupSectionsHtml || '<div class="card"><div class="empty">No services configured</div></div>'}
+    </div>
 
     <div class="section-title">Recent Downtime</div>
     <div class="card">
@@ -681,12 +685,10 @@ function renderSvcRowServer(s, tokenQ) {
 
     function renderSvcRow(s) {
       var cls = rowClass(s.status);
-      var target = s.path ? (s.host + ':' + s.port + s.path) : (s.host + ':' + s.port);
       var ignoredTag = s.ignored ? ' <span class="tag-ignored">ignored</span>' : '';
       var lastChecked = s.lastCheckedAt ? new Date(s.lastCheckedAt).toLocaleTimeString() : '-';
       return '<tr class="' + cls + '" data-name="' + escapeHtml(s.name.toLowerCase()) + '">' +
         '<td><span class="dot ' + dotClass(s.status) + '"></span><strong>' + escapeHtml(s.name) + '</strong>' + ignoredTag + '</td>' +
-        '<td class="mono">' + escapeHtml(target) + '</td>' +
         '<td>' + (s.path ? 'HTTP' : 'TCP') + '</td>' +
         '<td><span class="badge ' + cls + '">' + escapeHtml(s.status) + '</span>' + networkTag(s) + '</td>' +
         '<td class="mono">' + (s.statusCode || '-') + '</td>' +
@@ -823,7 +825,10 @@ const server = http.createServer((req, res) => {
 
   if (url.pathname === '/api/status') {
     return send(res, 200, JSON.stringify({
-      services: services.map(s => ({ ...s, slaPercent: uptimePercent(s.name), ignored: cfg.ignore.has(s.name) })),
+      services: services.map(s => {
+        const { host, port, ...safe } = s; // don't expose internal targets over the wire
+        return { ...safe, slaPercent: uptimePercent(s.name), ignored: cfg.ignore.has(s.name) };
+      }),
       history: history.slice(0, 30),
       lastPollAt,
       staleMs: cfg.checkIntervalMs * 3
