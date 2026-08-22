@@ -29,6 +29,8 @@ const cfg = {
   escalationMin: parseInt(process.env.ESCALATION_MINUTES || '10', 10),
   accessToken: process.env.ACCESS_TOKEN || '',
   ignore: new Set((process.env.IGNORE_SERVICES || '').split(',').map(s => s.trim()).filter(Boolean)),
+  heartbeatUrl: process.env.HEARTBEAT_URL || '', // optional dead-man's-switch ping (e.g. healthchecks.io)
+  defaultMuteMinutes: parseInt(process.env.DEFAULT_MUTE_MINUTES || '60', 10),
   smtp: {
     host: process.env.SMTP_HOST || '',
     port: parseInt(process.env.SMTP_PORT || '587', 10),
@@ -36,20 +38,33 @@ const cfg = {
     pass: process.env.SMTP_PASS || '',
     to: process.env.ALERT_EMAIL_TO || ''
   },
-  // SERVICES format: name:host:port[:httpPath], comma-separated.
-  // No httpPath -> plain TCP connect check. With httpPath -> HTTP GET, expects 2xx/3xx.
+  // SERVICES format: name:host:port[:httpPath|dbKind], comma-separated.
+  //   - No 4th field         -> plain TCP connect check
+  //   - 4th field starts "/" -> HTTP GET, expects 2xx/3xx
+  //   - 4th field is one of postgres|mysql|mariadb|redis -> a real protocol-level check for that
+  //     database (see checkPostgres/checkMysql/checkRedis below) instead of a bare TCP connect.
+  //     No credentials required or stored — these confirm the real DB wire protocol responds,
+  //     not just that a query succeeds, so they won't catch things like connection-pool exhaustion.
   services: (process.env.SERVICES || '')
     .split(',')
     .map(s => s.trim())
     .filter(Boolean)
     .map(entry => {
       const parts = entry.split(':');
-      const [name, host, portStr, ...pathParts] = parts;
+      const [name, host, portStr, ...rest] = parts;
+      const DB_KINDS = ['postgres', 'mysql', 'mariadb', 'redis'];
+      let path = null, dbKind = null;
+      if (rest.length) {
+        const fourth = rest.join(':');
+        if (DB_KINDS.includes(fourth.toLowerCase())) dbKind = fourth.toLowerCase();
+        else path = fourth;
+      }
       return {
         name,
         host: host || '127.0.0.1',
         port: parseInt(portStr, 10),
-        path: pathParts.length ? pathParts.join(':') : null
+        path,
+        dbKind
       };
     })
     .filter(s => s.name && s.port),
@@ -92,6 +107,7 @@ let historyDirty = false;
 let failStreaks = {};           // name -> consecutive failed checks (resets on any success)
 let latencyHistory = {};        // name -> [latencyMs, ...] capped rolling window, powers the card sparkline
 const LATENCY_HISTORY_LEN = 20;
+let mutedUntil = {};            // name -> epoch ms until which alerts are suppressed (maintenance mode)
 
 try {
   if (fs.existsSync(HISTORY_FILE)) {
@@ -172,8 +188,33 @@ function shouldAlert(name, kind) {
   return false;
 }
 
+function isMuted(name) {
+  return !!(mutedUntil[name] && Date.now() < mutedUntil[name]);
+}
+
+// Dead-man's switch: ping an external watcher (e.g. https://hc-ping.com/<uuid> from
+// healthchecks.io) every time a check cycle actually completes. If this monitor process
+// itself dies or hangs, the external service notices the pings stopped and alerts on
+// *that* — otherwise nothing would ever tell you the watcher itself went dark.
+function sendHeartbeat() {
+  if (!cfg.heartbeatUrl) return;
+  try {
+    const url = new URL(cfg.heartbeatUrl);
+    const lib = url.protocol === 'http:' ? http : https;
+    const req = lib.get(url, { timeout: 5000 }, res => res.resume());
+    req.on('error', () => { /* best-effort; a missed heartbeat is exactly what the external watcher should catch */ });
+    req.on('timeout', () => req.destroy());
+  } catch (e) {
+    log('Heartbeat send failed: ' + e.message);
+  }
+}
+
 function sendAlert(text, name = '', kind = 'generic') {
   if (name && cfg.ignore.has(name)) return;
+  if (name && isMuted(name)) {
+    log(`Muted alert -> ${name} (${kind}) — under maintenance until ${new Date(mutedUntil[name]).toISOString()}`);
+    return;
+  }
   if (name && !shouldAlert(name, kind)) {
     log(`Throttled alert -> ${name} (${kind})`);
     return;
@@ -296,14 +337,95 @@ function pingHost(host, timeoutSec) {
   });
 }
 
+// ────────────────────────────────────────────────
+// Protocol-level DB checks — no credentials required or stored anywhere. These confirm the
+// actual database wire protocol responds, which is a much stronger signal than "the TCP port
+// is open" (a hung/overloaded DB can still accept TCP connections). They do NOT run a real
+// query, so they won't catch things like connection-pool exhaustion at the query layer —
+// that would require real credentials, which we deliberately don't ask for or store here.
+// ────────────────────────────────────────────────
+
+function checkRedis(host, portNum, timeoutMs) {
+  return new Promise(resolve => {
+    const start = Date.now();
+    let buf = Buffer.alloc(0);
+    const socket = net.createConnection({ host, port: portNum, timeout: timeoutMs });
+    const done = ok => { socket.destroy(); resolve({ ok, latencyMs: Date.now() - start }); };
+    socket.once('connect', () => socket.write('PING\r\n'));
+    socket.on('data', chunk => {
+      buf = Buffer.concat([buf, chunk]);
+      if (buf.length > 0) {
+        // Any well-formed RESP reply type byte (+, -, :, $, *) proves a real Redis server
+        // answered — even "-NOAUTH" or "-ERR" counts, since that's still Redis's own protocol.
+        done(['+', '-', ':', '$', '*'].includes(String.fromCharCode(buf[0])));
+      }
+    });
+    socket.once('timeout', () => done(false));
+    socket.once('error', () => done(false));
+  });
+}
+
+function checkMysql(host, portNum, timeoutMs) {
+  return new Promise(resolve => {
+    const start = Date.now();
+    let buf = Buffer.alloc(0);
+    const socket = net.createConnection({ host, port: portNum, timeout: timeoutMs });
+    const done = ok => { socket.destroy(); resolve({ ok, latencyMs: Date.now() - start }); };
+    // MySQL/MariaDB send an unsolicited handshake packet the instant a client connects —
+    // we don't send anything, just read it and check the protocol-version byte.
+    socket.on('data', chunk => {
+      buf = Buffer.concat([buf, chunk]);
+      if (buf.length >= 5) {
+        const protocolVersion = buf[4];
+        done(protocolVersion === 0x0a || protocolVersion === 0x09);
+      }
+    });
+    socket.once('timeout', () => done(false));
+    socket.once('error', () => done(false));
+  });
+}
+
+function checkPostgres(host, portNum, timeoutMs) {
+  return new Promise(resolve => {
+    const start = Date.now();
+    let buf = Buffer.alloc(0);
+    const socket = net.createConnection({ host, port: portNum, timeout: timeoutMs });
+    const done = ok => { socket.destroy(); resolve({ ok, latencyMs: Date.now() - start }); };
+    socket.once('connect', () => {
+      // Minimal StartupMessage (protocol 3.0) with a throwaway username — Postgres always
+      // responds in its own wire format (an 'R' auth request or an 'E' error), even if the
+      // user doesn't exist or auth would fail. We only need a genuine protocol response,
+      // not a successful login.
+      const userField = Buffer.from('user\0postgres\0\0', 'utf8');
+      const protoVersion = Buffer.alloc(4);
+      protoVersion.writeInt32BE(196608, 0); // protocol 3.0
+      const length = Buffer.alloc(4);
+      length.writeInt32BE(4 + protoVersion.length + userField.length, 0);
+      socket.write(Buffer.concat([length, protoVersion, userField]));
+    });
+    socket.on('data', chunk => {
+      buf = Buffer.concat([buf, chunk]);
+      if (buf.length > 0) {
+        // Every Postgres backend message starts with a single uppercase-letter type byte.
+        const msgType = buf[0];
+        done(msgType >= 0x41 && msgType <= 0x5a); // 'A'-'Z'
+      }
+    });
+    socket.once('timeout', () => done(false));
+    socket.once('error', () => done(false));
+  });
+}
+
 async function checkServices() {
   if (!cfg.services.length) return;
 
   lastPollAt = Date.now();
 
   const results = await Promise.all(cfg.services.map(async svc => {
-    const result = svc.path
-      ? await checkHttp(svc.host, svc.port, svc.path, cfg.checkTimeoutMs)
+    const result = svc.dbKind === 'redis' ? await checkRedis(svc.host, svc.port, cfg.checkTimeoutMs)
+      : svc.dbKind === 'mysql' || svc.dbKind === 'mariadb' ? await checkMysql(svc.host, svc.port, cfg.checkTimeoutMs)
+      : svc.dbKind === 'postgres' ? await checkPostgres(svc.host, svc.port, cfg.checkTimeoutMs)
+      : svc.path ? await checkHttp(svc.host, svc.port, svc.path, cfg.checkTimeoutMs)
       : await checkTcp(svc.host, svc.port, cfg.checkTimeoutMs);
 
     let network = null;
@@ -315,7 +437,7 @@ async function checkServices() {
       status = 'online';
     } else {
       failStreaks[svc.name] = (failStreaks[svc.name] || 0) + 1;
-      const baseReason = svc.path ? 'http-check-failed' : 'port-unreachable';
+      const baseReason = svc.dbKind ? `${svc.dbKind}-check-failed` : svc.path ? 'http-check-failed' : 'port-unreachable';
 
       if (failStreaks[svc.name] < cfg.failureThreshold) {
         // Below threshold — likely a blip (slow response, transient network hiccup).
@@ -345,12 +467,15 @@ async function checkServices() {
     host: r.host,
     port: r.port,
     path: r.path,
+    dbKind: r.dbKind,
     status: r.status,
     latencyMs: r.latencyMs,
     statusCode: r.statusCode || null,
     network: r.network,
     failStreak: failStreaks[r.name] || 0,
     group: cfg.serviceGroups[r.name] || 'Other',
+    muted: isMuted(r.name),
+    mutedUntil: mutedUntil[r.name] || null,
     lastCheckedAt: Date.now()
   }));
 
@@ -371,6 +496,7 @@ async function checkServices() {
 
   checkEscalations();
   persistHistory();
+  sendHeartbeat(); // dead-man's switch: tells an external watcher this cycle actually completed
 }
 
 // ────────────────────────────────────────────────
@@ -481,17 +607,50 @@ function cardDescription(s) {
   return `SLA 7d ${uptimePercent(s.name)}% · checked ${checked}`;
 }
 
+function checkLabel(s) {
+  if (s.dbKind) return s.dbKind.toUpperCase();
+  return s.path ? 'HTTP' : 'TCP';
+}
+
+function buildInsight(list) {
+  const down = list.filter(s => s.status === 'stopped' && !cfg.ignore.has(s.name) && !isMuted(s.name));
+  const degraded = list.filter(s => s.status === 'degraded');
+  const mutedCount = list.filter(s => s.muted).length;
+
+  if (down.length === 0 && degraded.length === 0) {
+    return mutedCount > 0
+      ? `&#9989; All ${list.length} services healthy. <span class="insight-muted">(${mutedCount} muted for maintenance)</span>`
+      : `&#9989; All ${list.length} services healthy.`;
+  }
+  const parts = [];
+  if (down.length > 0) {
+    parts.push(`<strong>${down.length} down:</strong> ${down.map(s => escapeHtml(s.name)).join(', ')}`);
+  }
+  if (degraded.length > 0) {
+    parts.push(`<span class="insight-degraded">${degraded.length} checking (unconfirmed):</span> ${degraded.map(s => escapeHtml(s.name)).join(', ')}`);
+  }
+  const prefix = down.length > 0 ? '&#128308;' : '&#9888;';
+  return `${prefix} ${parts.join(' &middot; ')}`;
+}
+
 function renderMetricCardServer(s, tokenQ) {
   const cls = rowClassOf(s.status);
   const ignored = cfg.ignore.has(s.name) ? ' <span class="tag-ignored">ignored</span>' : '';
+  const mutedTag = s.muted ? ` <span class="tag-muted" title="Alerts silenced until ${escapeHtml(new Date(s.mutedUntil).toLocaleString())}">muted</span>` : '';
   const spark = sparklineSvg(latencyHistory[s.name], s.status === 'online' ? '#3b82f6' : '#dc2626');
+  const muteAction = s.muted
+    ? `<a class="metric-card-mute" href="/api/unmute/${encodeURIComponent(s.name)}${tokenQ}" data-action="unmute" data-name="${escapeHtml(s.name)}" title="Resume alerts">Unmute</a>`
+    : `<a class="metric-card-mute" href="/api/mute/${encodeURIComponent(s.name)}${tokenQ}${tokenQ ? '&' : '?'}minutes=${cfg.defaultMuteMinutes}" data-action="mute" data-name="${escapeHtml(s.name)}" title="Silence alerts for ${cfg.defaultMuteMinutes} minutes (e.g. during a deploy)">Mute</a>`;
   return `
     <div class="metric-card ${cls}" data-name="${escapeHtml(s.name.toLowerCase())}">
       <div class="metric-card-top">
-        <span class="metric-card-label">${s.path ? 'HTTP' : 'TCP'} check${networkTag(s)}</span>
-        <a class="metric-card-menu" href="/logs/${encodeURIComponent(s.name)}${tokenQ}" title="View logs">&#8942;</a>
+        <span class="metric-card-label">${checkLabel(s)} check${networkTag(s)}</span>
+        <span class="metric-card-actions">
+          ${muteAction}
+          <a class="metric-card-menu" href="/logs/${encodeURIComponent(s.name)}${tokenQ}" title="View logs">&#8942;</a>
+        </span>
       </div>
-      <div class="metric-card-title">${escapeHtml(s.name)}${ignored}</div>
+      <div class="metric-card-title">${escapeHtml(s.name)}${ignored}${mutedTag}</div>
       <div class="metric-card-value" style="color:${statusColorVar(s.status)}">
         <span class="dot ${statusDotClass(s.status)}"></span>${escapeHtml(s.status.toUpperCase())}
       </div>
@@ -514,6 +673,7 @@ function renderDashboard(tokenQ = '') {
     : 0;
 
   const stale = lastPollAt && (Date.now() - lastPollAt) > cfg.checkIntervalMs * 3;
+  const insight = buildInsight(services);
 
   const kpiCards = `
     <div class="kpi-grid">
@@ -567,8 +727,12 @@ function renderDashboard(tokenQ = '') {
       .sort((a, b) => statusRankOf(a.status) - statusRankOf(b.status) || a.name.localeCompare(b.name));
     const gid = sanitizeGroupId(group);
     const groupCards = groupServices.map(s => renderMetricCardServer(s, tokenQ)).join('');
+    const gOnline = groupServices.filter(s => s.status === 'online').length;
+    const gDown = groupServices.filter(s => s.status === 'stopped').length;
+    const chipClass = gDown > 0 ? 'group-chip bad' : 'group-chip good';
+    const chip = groupServices.length ? `<span class="${chipClass}" id="chip-${gid}">${gOnline} online${gDown ? ` · ${gDown} down` : ''}</span>` : '';
     return `
-    <div class="section-title">${escapeHtml(group)} <span class="sub">${groupServices.length} service${groupServices.length === 1 ? '' : 's'}</span></div>
+    <div class="section-title">${escapeHtml(group)} <span class="sub">${groupServices.length} service${groupServices.length === 1 ? '' : 's'}</span> ${chip}</div>
     <div class="metric-grid" data-group="${gid}" id="cardsGrid-${gid}">
       ${groupCards || '<div class="card"><div class="empty">No services in this group</div></div>'}
     </div>`;
@@ -653,6 +817,29 @@ function renderDashboard(tokenQ = '') {
     .metric-card-chart { line-height: 0; margin-bottom: 10px; }
     .metric-card-chart svg { width: 100%; height: 32px; }
     .metric-card-desc { font-size: 0.76rem; color: var(--muted); line-height: 1.4; }
+    .metric-card-actions { display: flex; align-items: center; gap: 6px; }
+    .metric-card-mute {
+      font-size: 0.62rem; color: var(--muted); text-decoration: none; font-weight: 600;
+      background: #f1f5f9; padding: 2px 8px; border-radius: 999px; letter-spacing: 0.02em;
+    }
+    .metric-card-mute:hover { background: #e2e8f0; color: var(--text); }
+    .metric-card-mute[data-action="unmute"] { background: #ffedd5; color: #9a3412; }
+    .metric-card-mute[data-action="unmute"]:hover { background: #fed7aa; }
+    .tag-muted { font-size: 0.62rem; color: #9a3412; background: #ffedd5; padding: 1px 7px; border-radius: 999px; margin-left: 6px; font-weight: 600; cursor: help; }
+
+    .insight-banner {
+      background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+      padding: 12px 18px; font-size: 0.88rem; margin-bottom: 22px; line-height: 1.5;
+    }
+    .insight-banner .insight-degraded { color: var(--orange); font-weight: 600; }
+    .insight-banner .insight-muted { color: var(--muted); font-size: 0.8rem; }
+
+    .group-chip {
+      font-size: 0.72rem; font-weight: 600; padding: 2px 10px; border-radius: 999px;
+      margin-left: 4px;
+    }
+    .group-chip.good { background: #dcfce7; color: #166534; }
+    .group-chip.bad  { background: #fee2e2; color: #991b1b; }
 
     .mono { font-variant-numeric: tabular-nums; font-family: ui-monospace, 'SF Mono', Menlo, monospace; }
     .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 8px; }
@@ -694,6 +881,7 @@ function renderDashboard(tokenQ = '') {
   <div class="wrap">
     <div class="stale-banner" id="staleBanner">&#9888; No successful check in a while — the monitor process may be stalled.</div>
     <div class="empty-banner">&#8505; <strong>SERVICES is empty in .env</strong> — nothing is being monitored yet. Add entries like <code>name:host:port</code> and restart.</div>
+    <div class="insight-banner" id="insightBanner">${insight}</div>
 
     ${kpiCards}
 
@@ -715,12 +903,13 @@ function renderDashboard(tokenQ = '') {
       </table>
     </div>
 
-    <footer>Service Status Monitor &middot; <a href="/health${tokenQ}" style="color:inherit">health</a> &middot; <a href="/api/status${tokenQ}" style="color:inherit">raw json</a></footer>
+    <footer>Service Status Monitor &middot; <a href="/health${tokenQ}" style="color:inherit">health</a> &middot; <a href="/api/status${tokenQ}" style="color:inherit">raw json</a> &middot; <a href="/export/history.csv${tokenQ}" style="color:inherit">export CSV</a></footer>
   </div>
 
   <script>
     var TOKEN_QS = '${tokenQ}';
     var POLL_MS = ${Math.max(3000, cfg.checkIntervalMs)};
+    var DEFAULT_MUTE_MINUTES = ${cfg.defaultMuteMinutes};
 
     function escapeHtml(str) {
       return String(str == null ? '' : str).replace(/[&<>"']/g, function (c) {
@@ -807,17 +996,29 @@ function renderDashboard(tokenQ = '') {
       return 'SLA 7d ' + s.slaPercent + '% · checked ' + checked;
     }
 
+    function checkLabel(s) {
+      if (s.dbKind) return s.dbKind.toUpperCase();
+      return s.path ? 'HTTP' : 'TCP';
+    }
+
     function renderMetricCard(s) {
       var cls = rowClass(s.status);
       var ignoredTag = s.ignored ? ' <span class="tag-ignored">ignored</span>' : '';
+      var mutedTag = s.muted ? ' <span class="tag-muted" title="Alerts silenced until ' + escapeHtml(new Date(s.mutedUntil).toLocaleString()) + '">muted</span>' : '';
       var hist = s.latencySamples || [];
       var spark = sparklineSvg(hist, s.status === 'online' ? '#3b82f6' : '#dc2626');
+      var muteAction = s.muted
+        ? '<a class="metric-card-mute" href="/api/unmute/' + encodeURIComponent(s.name) + TOKEN_QS + '" data-action="unmute" data-name="' + escapeHtml(s.name) + '" title="Resume alerts">Unmute</a>'
+        : '<a class="metric-card-mute" href="/api/mute/' + encodeURIComponent(s.name) + TOKEN_QS + (TOKEN_QS ? '&' : '?') + 'minutes=' + DEFAULT_MUTE_MINUTES + '" data-action="mute" data-name="' + escapeHtml(s.name) + '" title="Silence alerts for ' + DEFAULT_MUTE_MINUTES + ' minutes">Mute</a>';
       return '<div class="metric-card ' + cls + '" data-name="' + escapeHtml(s.name.toLowerCase()) + '">' +
         '<div class="metric-card-top">' +
-          '<span class="metric-card-label">' + (s.path ? 'HTTP' : 'TCP') + ' check' + networkTag(s) + '</span>' +
-          '<a class="metric-card-menu" href="/logs/' + encodeURIComponent(s.name) + TOKEN_QS + '" title="View logs">&#8942;</a>' +
+          '<span class="metric-card-label">' + checkLabel(s) + ' check' + networkTag(s) + '</span>' +
+          '<span class="metric-card-actions">' +
+            muteAction +
+            '<a class="metric-card-menu" href="/logs/' + encodeURIComponent(s.name) + TOKEN_QS + '" title="View logs">&#8942;</a>' +
+          '</span>' +
         '</div>' +
-        '<div class="metric-card-title">' + escapeHtml(s.name) + ignoredTag + '</div>' +
+        '<div class="metric-card-title">' + escapeHtml(s.name) + ignoredTag + mutedTag + '</div>' +
         '<div class="metric-card-value" style="color:' + statusColorVar(s.status) + '">' +
           '<span class="dot ' + dotClass(s.status) + '"></span>' + escapeHtml(s.status.toUpperCase()) +
         '</div>' +
@@ -869,6 +1070,9 @@ function renderDashboard(tokenQ = '') {
         document.getElementById('kpiSla').innerHTML = avgSla + '<span class="kpi-value-muted">%</span>';
         document.getElementById('kpiLatency').innerHTML = avgLatency + '<span class="kpi-value-muted">ms</span>';
 
+        var insightEl = document.getElementById('insightBanner');
+        if (insightEl && data.insight) insightEl.innerHTML = data.insight;
+
         if (data.services.length) {
           var statusRank = { stopped: 0, degraded: 1, online: 2 };
           var byGroup = {};
@@ -877,16 +1081,27 @@ function renderDashboard(tokenQ = '') {
             (byGroup[g] = byGroup[g] || []).push(s);
           });
           Object.keys(byGroup).forEach(function (g) {
-            var grid = document.getElementById('cardsGrid-' + sanitizeGroupId(g));
+            var gid = sanitizeGroupId(g);
+            var grid = document.getElementById('cardsGrid-' + gid);
             if (!grid) return; // group didn't exist at initial render (SERVICES changed without restart) — skip rather than break
-            var sorted = byGroup[g].slice().sort(function (a, b) {
+            var groupList = byGroup[g];
+            var sorted = groupList.slice().sort(function (a, b) {
               var ra = statusRank.hasOwnProperty(a.status) ? statusRank[a.status] : 1;
               var rb = statusRank.hasOwnProperty(b.status) ? statusRank[b.status] : 1;
               return ra - rb || a.name.localeCompare(b.name);
             });
             grid.innerHTML = sorted.map(renderMetricCard).join('');
+
+            var chip = document.getElementById('chip-' + gid);
+            if (chip) {
+              var gOnline = groupList.filter(function (s) { return s.status === 'online'; }).length;
+              var gDown = groupList.filter(function (s) { return s.status === 'stopped'; }).length;
+              chip.textContent = gOnline + ' online' + (gDown ? ' · ' + gDown + ' down' : '');
+              chip.className = 'group-chip ' + (gDown > 0 ? 'bad' : 'good');
+            }
           });
           applyFilter();
+          bindMuteButtons();
         }
 
         if (data.history.length) {
@@ -903,7 +1118,24 @@ function renderDashboard(tokenQ = '') {
       }
     }
 
+    // Mute/Unmute buttons hit the API via fetch instead of navigating away from the dashboard.
+    // Re-bound after every card re-render since the buttons are recreated each time.
+    function bindMuteButtons() {
+      document.querySelectorAll('.metric-card-mute').forEach(function (btn) {
+        btn.onclick = async function (e) {
+          e.preventDefault();
+          try {
+            await fetch(btn.href, { cache: 'no-store' });
+          } catch (err) {
+            // best-effort; refreshStatus below will just show the pre-toggle state if this failed
+          }
+          refreshStatus();
+        };
+      });
+    }
+
     document.getElementById('filterInput').addEventListener('input', applyFilter);
+    bindMuteButtons();
     refreshStatus();
     setInterval(refreshStatus, POLL_MS);
   </script>
@@ -959,9 +1191,12 @@ const server = http.createServer((req, res) => {
           ...safe,
           slaPercent: uptimePercent(s.name),
           ignored: cfg.ignore.has(s.name),
+          muted: isMuted(s.name),
+          mutedUntil: mutedUntil[s.name] || null,
           latencySamples: latencyHistory[s.name] || []
         };
       }),
+      insight: buildInsight(services),
       history: history.slice(0, 30),
       lastPollAt,
       staleMs: cfg.checkIntervalMs * 3
@@ -989,6 +1224,36 @@ const server = http.createServer((req, res) => {
     return send(res, 200, renderLogsPage(name, content, tokenQ));
   }
 
+  if (url.pathname.startsWith('/api/mute/')) {
+    const name = decodeURIComponent(url.pathname.slice('/api/mute/'.length));
+    const minutes = parseInt(url.searchParams.get('minutes'), 10) || cfg.defaultMuteMinutes;
+    mutedUntil[name] = Date.now() + minutes * 60 * 1000;
+    log(`MUTE -> ${name} for ${minutes}m (until ${new Date(mutedUntil[name]).toISOString()})`);
+    return send(res, 200, JSON.stringify({ name, muted: true, until: mutedUntil[name] }, null, 2), 'application/json');
+  }
+
+  if (url.pathname.startsWith('/api/unmute/')) {
+    const name = decodeURIComponent(url.pathname.slice('/api/unmute/'.length));
+    delete mutedUntil[name];
+    log(`UNMUTE -> ${name}`);
+    return send(res, 200, JSON.stringify({ name, muted: false }, null, 2), 'application/json');
+  }
+
+  if (url.pathname === '/export/history.csv') {
+    const rows = [['name', 'downAt', 'upAt', 'durationMs', 'reason']];
+    history.forEach(h => rows.push([h.name, h.downAt, h.upAt || '', h.durationMs != null ? h.durationMs : '', h.reason || '']));
+    const csv = rows.map(r => r.map(field => {
+      const s = String(field);
+      return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    }).join(',')).join('\n');
+    res.writeHead(200, {
+      'Content-Type': 'text/csv',
+      'Content-Disposition': 'attachment; filename="downtime-history.csv"',
+      'Cache-Control': 'no-store'
+    });
+    return res.end(csv);
+  }
+
   send(res, 404, 'Not found');
 });
 
@@ -1004,6 +1269,22 @@ function shutdown(sig) {
 }
 process.on('SIGINT',  () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+// ────────────────────────────────────────────────
+// Crash safety net — one bad response/parse anywhere must not silently kill monitoring
+// with zero trace. Log it, persist whatever state we have, then exit so PM2 restarts us
+// into a clean process rather than continuing to run in a possibly-corrupted state.
+// ────────────────────────────────────────────────
+process.on('uncaughtException', err => {
+  log('FATAL uncaughtException: ' + (err && err.stack ? err.stack : err));
+  try { historyDirty = true; persistHistory(); } catch (_) { /* best effort */ }
+  process.exit(1);
+});
+process.on('unhandledRejection', err => {
+  log('FATAL unhandledRejection: ' + (err && err.stack ? err.stack : err));
+  try { historyDirty = true; persistHistory(); } catch (_) { /* best effort */ }
+  process.exit(1);
+});
 
 // ────────────────────────────────────────────────
 // Start
